@@ -102,6 +102,8 @@ class LocalExecutor:
 
         def done(f: asyncio.Future) -> None:
             self.inflight -= 1
+            if f.cancelled():                     # executor shut down: the game is being handed over anyway
+                return
             try:
                 res = f.result()
             except Exception as exc:              # noqa: BLE001 -- a crashed turn becomes the fallback, not a dead game
