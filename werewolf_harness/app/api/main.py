@@ -58,10 +58,12 @@ def build_runtime(settings: Settings, store: Store, redis: Redis, env_keys: dict
     hooks = ActorHooks(on_finish=on_finish,
                        on_commit=lambda t, ms: metrics.COMMIT_MS.observe(ms),
                        on_stale=lambda t: metrics.STALE_RESULTS.inc())
+    from ..llm.gateway import Hub
+    hub = Hub(settings.redis_url, env_keys=env_keys)
     if executor is None and settings.agent_executor == "streams":
         from ..llm.queue import StreamExecutor
         executor = StreamExecutor(redis, settings)
-    rt = Runtime(settings, store, redis, executor=executor, env_keys=env_keys, hooks=hooks)
+    rt = Runtime(settings, store, redis, executor=executor, env_keys=env_keys, hooks=hooks, hub=hub)
     rt.listeners.append(lambda kind, d: metrics.ADOPTIONS.inc() if kind == "adopted" else None)
     return rt
 
@@ -203,7 +205,8 @@ def _routes(app: FastAPI) -> None:
     async def meta(request: Request):
         return {"variants": {k: {"seats": v.num_players, "sheriff": v.sheriff, "roles": v.role_counts}
                              for k, v in VARIANTS.items()},
-                "models": offered(request.app.state.env_keys) + ["mock", "script"],
+                "models": offered(request.app.state.env_keys) + ["mock", "script", "sim", "sim-strong", "sim-cheap",
+                                                                  "sim-flaky"],
                 "profiles": PROFILES, "guards": ["无", "L1", "L1+L2", "L1+L2+L3"]}
 
     @app.get("/api/games")
@@ -245,7 +248,9 @@ def _routes(app: FastAPI) -> None:
                           guard=body.get("guard", "L1+L2+L3"), playbook=body.get("playbook", "static"),
                           human_seats=[int(x) for x in body.get("human_seats", [])],
                           turn_seconds=None if body.get("turn_seconds") in (None, 0, "0") else float(body["turn_seconds"]),
-                          max_tokens=int(body.get("max_tokens") or DEFAULT_MAX_TOKENS), xray=bool(body.get("xray")))
+                          max_tokens=int(body.get("max_tokens") or DEFAULT_MAX_TOKENS), xray=bool(body.get("xray")),
+                          fallbacks=list(body.get("fallbacks") or []), routing=body.get("routing") or None,
+                          lane=body.get("lane"))
         try:
             a = await s.rt.create(cfg, seed=int(body.get("seed") or 0) or None, created_by=user["id"])
         except ValueError as e:
@@ -334,6 +339,12 @@ def _routes(app: FastAPI) -> None:
                     return
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/stats/llm")
+    async def llm_stats(request: Request, game: str | None = None):
+        s = svc(request)
+        await s.rt.flush_calls()
+        return await s.store.call_stats(game)
 
     # ---------------------------------------------------------- leaderboard
     @app.get("/api/leaderboard")

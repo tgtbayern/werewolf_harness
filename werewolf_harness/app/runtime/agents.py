@@ -25,6 +25,7 @@ from ...arena import ActionSpec
 from ...players.budget import BudgetExhausted
 from ...players.llm.belief import BeliefState
 from ...players.recovery import GatewayExhausted
+from .rules_npc import rule_action
 
 
 @dataclass
@@ -39,6 +40,7 @@ class AgentJob:
     make_player: Callable[..., Any]          # (on_step) -> Player
     on_step: Callable[[int, Any], None] | None = None
     max_retries: int = 3
+    lane: str = "online"                      # human (a person is waiting) | online | offline
 
 
 @dataclass
@@ -82,7 +84,12 @@ def run_agent_turn(job: AgentJob) -> AgentResult:
     last = getattr(player, "last_turn", None)
     if last is not None:
         meta.update({"prompt_tokens": last.prompt_tokens, "completion_tokens": last.completion_tokens,
-                     "fallback_used": last.fallback_used, "steps": len(last.steps)})
+                     "fallback_used": last.fallback_used, "steps": len(last.steps),
+                     "trace": [s.to_dict() for s in last.steps][-8:]})
+        if forced and last.fallback_used == "transport_failure":
+            # no model could answer this turn: decide by rule from the seat's own beliefs
+            action = rule_action(job.task, job.spec, player.belief.snapshot())
+            meta["rule_npc"] = True
     memory = (player.belief.snapshot(), player.note) if llm else None
     return AgentResult(job.game_id, job.seat, job.version, action, forced, memory, meta)
 

@@ -23,6 +23,16 @@ turn with a terminal action.
 Speeches from earlier rounds are NOT shown to you. Use query_history to recall
 them."""
 
+OUTPUT_CONTRACT_STATIC = """\
+Work in short steps. On each step, either call one information tool or end your
+turn with a terminal action. The tools this turn offers are listed under THIS TURN.
+- You have at most {max_steps} steps. If you reach the last step without a
+  terminal action, one will be forced from you.
+- Do not invent tool names.
+
+Speeches from earlier rounds are NOT shown to you. Use query_history to recall
+them."""
+
 _ACTION_CN = {"night_check": "验人", "night_kill": "刀人", "night_save": "用解药救", "night_poison": "用毒药毒",
               "night_protect": "守护", "night_skip": "夜里空过", "speak": "发言", "vote": "投票",
               "last_words": "留遗言", "campaign_run": "竞选警长", "campaign_pass": "退出竞选",
@@ -40,21 +50,38 @@ _SPEECH_LABEL = {"campaign": ", running for sheriff",
 
 class ContextBuilder:
     def __init__(self, guard: GuardStack, max_steps: int = 8, max_observation_chars: int = MAX_OBSERVATION_CHARS,
-                 max_steps_in_context: int = MAX_STEPS_IN_CONTEXT, anonymise_speakers: bool = False):
+                 max_steps_in_context: int = MAX_STEPS_IN_CONTEXT, anonymise_speakers: bool = False,
+                 cache_layout: bool = True):
         self.guard = guard
         self.max_steps = max_steps
         self.max_observation_chars = max_observation_chars
         self.max_steps_in_context = max_steps_in_context
         self.anonymise_speakers = anonymise_speakers
+        # Order the system message by how often each part changes, so the part every
+        # seat shares (rules, guard preamble, output contract) is a byte-identical
+        # prefix and hits the provider's prompt cache. The old order put the seat's
+        # private identity second, which made the shared prefix end after the rules.
+        self.cache_layout = cache_layout
 
     # ---------------------------------------------------------------- system
     def system_message(self, view: dict, terminal_names: list[str], info_names: list[str]) -> str:
-        parts = [view["rules"], "", self._identity(view), ""]
         preamble = self.guard.system_preamble()
+        if not self.cache_layout:
+            parts = [view["rules"], "", self._identity(view), ""]
+            if preamble:
+                parts += [preamble, ""]
+            parts.append(OUTPUT_CONTRACT.format(max_steps=self.max_steps, tool_lines=_tool_lines(info_names, terminal_names)))
+            parts += ["", f"You are player {view['you']}. Speak in the first person, in at most 4 sentences, like a player at the table."]
+            return "\n".join(parts)
+        # shared by every seat and every turn of this table
+        parts = [view["rules"], ""]
         if preamble:
             parts += [preamble, ""]
-        parts.append(OUTPUT_CONTRACT.format(max_steps=self.max_steps, tool_lines=_tool_lines(info_names, terminal_names)))
-        parts += ["", f"You are player {view['you']}. Speak in the first person, in at most 4 sentences, like a player at the table."]
+        parts += [OUTPUT_CONTRACT_STATIC.format(max_steps=self.max_steps), "",
+                  "Speak in the first person, in at most 4 sentences, like a player at the table.", ""]
+        # this seat, this turn
+        parts += [self._identity(view), "", "THIS TURN:", _tool_lines(info_names, terminal_names), "",
+                  f"You are player {view['you']}."]
         return "\n".join(parts)
 
     def _identity(self, view: dict) -> str:

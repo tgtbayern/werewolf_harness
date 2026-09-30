@@ -39,7 +39,7 @@ log = olog.get("runtime")
 
 class Runtime:
     def __init__(self, settings: Settings, store: Store, redis: Redis, *, executor=None,
-                 env_keys: dict | None = None, hooks: ActorHooks | None = None):
+                 env_keys: dict | None = None, hooks: ActorHooks | None = None, hub=None):
         self.s = settings
         self.store = store
         self.redis = redis
@@ -48,6 +48,7 @@ class Runtime:
         self.executor = executor or LocalExecutor(settings.agent_workers)
         self.wheel = TimingWheel(tick=0.1)
         self.env_keys = env_keys or {}
+        self.hub = hub                              # app.llm.gateway.Hub (model layer), optional
         self.hooks = hooks or ActorHooks()
         self.actors: dict[str, GameActor] = {}
         self.finished: dict[str, Table] = {}        # recently ended here, kept for readers (bounded)
@@ -61,6 +62,8 @@ class Runtime:
     async def start(self, scan: bool = True) -> None:
         self.wheel.start()
         self._tasks.append(asyncio.create_task(self._renew_loop(), name="lease-renew"))
+        if self.hub is not None:
+            self._tasks.append(asyncio.create_task(self._flush_calls(), name="llm-call-flush"))
         if scan:
             await self.scan()
             self._tasks.append(asyncio.create_task(self._scan_loop(), name="recovery-scan"))
@@ -77,6 +80,7 @@ class Runtime:
                 await self.leases.release(a.id)
         self.actors.clear()
         await self.wheel.stop()
+        await self.flush_calls()
         close = getattr(self.executor, "close", None)
         if close:
             await close()
@@ -92,7 +96,7 @@ class Runtime:
             raise RuntimeError("this node is draining; try again")
         gid = "g" + secrets.token_hex(4)
         seed = seed if seed is not None else int.from_bytes(secrets.token_bytes(2), "big")
-        table = Table(gid, seed, cfg, self.env_keys)
+        table = Table(gid, seed, cfg, self.env_keys, hub=self.hub)
         await self.store.create_game(game_id=gid, variant=cfg.variant, seed=seed, config=cfg.to_dict(),
                                      state=table.state, seats=table.seat_rows(), created_by=created_by)
         if not await self.leases.acquire(gid):
@@ -123,7 +127,7 @@ class Runtime:
                           human_seats=list(g.get("human_seats") or []), turn_seconds=None,
                           max_tokens=max_tokens or 6_000_000, xray=bool(g.get("xray")))
         gid = "g" + secrets.token_hex(4)
-        table = Table(gid, int(g["seed"]), cfg, self.env_keys)
+        table = Table(gid, int(g["seed"]), cfg, self.env_keys, hub=self.hub)
         self.replay(table, records)                       # validate before writing anything
         await self.store.create_game(game_id=gid, variant=cfg.variant, seed=table.seed, config=cfg.to_dict(),
                                      state="running", seats=table.seat_rows(), created_by=created_by,
@@ -192,7 +196,7 @@ class Runtime:
                 await self.leases.release(gid)
                 return None
             table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
-                          created=row["created_at"].timestamp())
+                          created=row["created_at"].timestamp(), hub=self.hub)
             table.state = row["state"]
             table.resumed_from = row.get("resumed_from")
             rows = await self.store.journal(gid)
@@ -245,6 +249,23 @@ class Runtime:
                 await self.scan()
             except Exception:                              # noqa: BLE001 -- a failed scan is retried next tick
                 log.exception("recovery scan failed")
+
+    async def _flush_calls(self) -> None:
+        """Model-call records are written in batches, off the hot path."""
+        while True:
+            await asyncio.sleep(1.0)
+            await self.flush_calls()
+
+    async def flush_calls(self) -> int:
+        if self.hub is None:
+            return 0
+        rows = [r.to_row() for r in self.hub.sink.drain(5000)]
+        if rows:
+            try:
+                await self.store.record_calls(rows)
+            except Exception:                              # noqa: BLE001 -- accounting must not stop games
+                log.exception("could not write llm_calls")
+        return len(rows)
 
     async def _renew_loop(self) -> None:
         while True:

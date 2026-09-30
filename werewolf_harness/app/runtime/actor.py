@@ -214,8 +214,10 @@ class GameActor:
                 self._arm(secs, TimerFired(v, "human"))
         else:
             job = AgentJob(self.id, turn.actor, v, turn.task, view, spec, self.t.memory.get(turn.actor),
-                           make_player=lambda on_step, s=turn.actor: self.t.make_player(s, on_step=on_step),
-                           on_step=self._step_from_thread)
+                           make_player=lambda on_step, s=turn.actor, task=turn.task, v=v:
+                           self.t.make_player(s, on_step=on_step, task=task, version=v),
+                           on_step=self._step_from_thread,
+                           lane=self.t.cfg.lane or ("human" if self.t.human_seats else "online"))
             self._arm(self.agent_timeout_s, TimerFired(v, "agent"))
             self.executor.submit(job, self.post)
         await self._notify(ev)
@@ -256,6 +258,10 @@ class GameActor:
             await self._notify(self.t.emit("error", message=self.t.error))
             self.stopped = "aborted"
             return
+        if r.meta.get("remote") and r.meta.get("trace"):
+            for st in r.meta["trace"]:          # a worker in another process cannot stream steps; they come with the result
+                self.t.traces.setdefault(r.seat, []).append({**st, "round": getattr(self.t.env, "_round", 0)})
+            self.t.traces[r.seat] = self.t.traces[r.seat][-40:]
         agent_states = [(r.seat, r.memory[0], r.memory[1])] if r.memory else []
         await self._commit(r.action, forced=r.forced, agent_states=agent_states, memory=(r.seat, r.memory))
 

@@ -50,6 +50,14 @@ class TableConfig:
     turn_seconds: float | None = 300.0
     max_tokens: int = 6_000_000
     xray: bool = False
+    # model layer (app/llm): try these after the seat's model fails, in order
+    fallbacks: list[str] = field(default_factory=list)
+    # route by task instead of by seat: {"strong": m1, "cheap": m2, "strong_tasks": [...]}
+    routing: dict | None = None
+    lane: str | None = None           # queue lane override (e.g. "offline" for batch experiments)
+    # Experiments abandon a game whose models keep failing (a sample the harness played
+    # is not a sample). A table with people at it keeps going on rule seats instead.
+    abort_on_outage: bool = False
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -73,11 +81,12 @@ class Event:
 
 class Table:
     def __init__(self, game_id: str, seed: int, cfg: TableConfig, env_keys: dict | None = None,
-                 created: float | None = None):
+                 created: float | None = None, hub=None):
         self.id = game_id
         self.seed = seed
         self.cfg = cfg
         self.env_keys = env_keys or {}
+        self.hub = hub                                   # app.llm.gateway.Hub, or None for direct clients
         self.created = created or time.time()
         self.n = VARIANTS[cfg.variant].num_players
         self.human_seats = [s for s in cfg.human_seats if 1 <= s <= self.n]
@@ -108,6 +117,10 @@ class Table:
         rota = list(self.models)
         random.Random(seed).shuffle(rota)
         self.seat_models: dict[int, str] = {s: rota[i % len(rota)] for i, s in enumerate(ai)}
+        if cfg.routing:
+            self.seat_models = {s: "route" for s in ai}
+            self.models = [cfg.routing["strong"], cfg.routing["cheap"]]
+            self.model_label = f"路由 {cfg.routing['strong']}/{cfg.routing['cheap']}"
 
         guards = tuple(x for x in cfg.guard.split("+") if x and x != "无")
         self.guard = GuardStack(guards)
@@ -123,15 +136,33 @@ class Table:
     def seat_rows(self) -> list[tuple[int, str, str | None]]:
         return [(s, self.seat_kind(s), self.seat_models.get(s)) for s in range(1, self.n + 1)]
 
-    def make_player(self, seat: int, client_factory=None, on_step=None):
+    STRONG_TASKS = ("vote", "night", "pack_plan", "hunter_shoot", "badge", "campaign_vote")
+
+    def model_for(self, seat: int, task: str | None) -> str:
+        m = self.seat_models[seat]
+        if m == "route" and self.cfg.routing:
+            strong = self.cfg.routing.get("strong_tasks") or self.STRONG_TASKS
+            return self.cfg.routing["strong"] if task in strong else self.cfg.routing["cheap"]
+        return m
+
+    def make_player(self, seat: int, client_factory=None, on_step=None, task: str | None = None,
+                    version: int | None = None):
         """A fresh player object for one turn. Model seats keep nothing between
         turns: their memory travels in and out with the job (see agents.py)."""
-        model = self.seat_models[seat]
+        model = self.model_for(seat, task)
         if model == "script":
             return RandomPlayer(self.seed * 100 + seat)
-        client = (client_factory or self.client_for)(model, seat)
-        pol = RecoveryPolicy(timeout_s=profile(model)["timeout_s"])
-        return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=self.transport,
+        if client_factory is None and self.hub is not None:
+            client = self.hub.client(model, self.seed * 100 + seat, game_id=self.id, seat=seat, seq=version,
+                                     max_game_tokens=self.cfg.max_tokens, fallbacks=self.cfg.fallbacks)
+        else:
+            client = (client_factory or self.client_for)(model, seat)
+        # Behind the gateway, fallbacks and backoff already happened once per call;
+        # retrying the whole chain again at the seat only multiplies the wait.
+        pol = RecoveryPolicy(timeout_s=profile(model)["timeout_s"],
+                             max_transport_retries=0 if self.hub is not None else RecoveryPolicy.max_transport_retries)
+        budget = self.transport if (self.cfg.abort_on_outage or self.hub is None) else None
+        return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
                          token_budget=self.tokens, playbook=self.cfg.playbook != "none",
                          on_step=on_step)
 
