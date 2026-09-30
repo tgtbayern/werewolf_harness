@@ -61,6 +61,9 @@ class Runtime:
     # ------------------------------------------------------------ lifecycle
     async def start(self, scan: bool = True) -> None:
         self.wheel.start()
+        start = getattr(self.executor, "start", None)
+        if start:
+            await start()
         self._tasks.append(asyncio.create_task(self._renew_loop(), name="lease-renew"))
         if self.hub is not None:
             self._tasks.append(asyncio.create_task(self._flush_calls(), name="llm-call-flush"))
