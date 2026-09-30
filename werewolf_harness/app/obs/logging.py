@@ -11,11 +11,11 @@ import logging
 import sys
 import time
 
-_ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("log_ctx", default={})
+_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar("log_ctx", default=None)
 
 
 def bind(**kw) -> contextvars.Token:
-    return _ctx.set({**_ctx.get(), **{k: v for k, v in kw.items() if v is not None}})
+    return _ctx.set({**(_ctx.get() or {}), **{k: v for k, v in kw.items() if v is not None}})
 
 
 def unbind(token: contextvars.Token) -> None:
@@ -25,7 +25,7 @@ def unbind(token: contextvars.Token) -> None:
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         row = {"ts": round(time.time(), 3), "level": record.levelname.lower(), "logger": record.name,
-               "msg": record.getMessage(), **_ctx.get()}
+               "msg": record.getMessage(), **(_ctx.get() or {})}
         extra = getattr(record, "fields", None)
         if extra:
             row.update(extra)

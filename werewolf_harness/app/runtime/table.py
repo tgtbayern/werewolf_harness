@@ -1,0 +1,312 @@
+"""One table's state and everything a client may read about it.
+
+This is the part of the old `server.service.Game` that is not about threads:
+dealing seats, building the model seats, turning steps into public news, and
+gating what each reader sees. The actor (actor.py) is the only thing that
+changes a Table; readers call the `*_view` methods.
+
+What a reader may see is decided in exactly one place, `may_see_all`, and every
+event and summary goes through `public_action` / `public_actor` before it leaves.
+Two leaks the old server had are closed here and pinned by tests:
+
+  * the event stream carried every raw action -- a night kill and a seat's
+    private `thought` went to anyone holding the SSE URL;
+  * the "who is acting" line named the night actor -- the first seat to act at
+    night is the seer, so a spectator could read roles off the order.
+"""
+from __future__ import annotations
+
+import random
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from ...arena import Record, StepLedger, Terminal, Turn
+from ...envs import VARIANTS, Werewolf
+from ...players import GuardStack, LLMPlayer, MockClient, RandomPlayer, RecoveryPolicy, TokenBudget, TransportBudget
+from ...players.human import Pending
+from ...players.providers import profile
+from ...server.service import _client as _provider_client
+
+# Tasks whose actor and (thought-free) action the whole table sees.
+PUBLIC_TASKS = frozenset({"speak", "vote", "campaign", "campaign_vote", "last_words", "hunter_shoot", "badge", "review"})
+
+
+def public_action(action: Any) -> Any:
+    """A seat's reasoning is its own: `thought` never travels to another reader."""
+    if not isinstance(action, dict):
+        return action
+    args = {k: v for k, v in (action.get("args") or {}).items() if k != "thought"}
+    return {**action, "args": args}
+
+
+@dataclass
+class TableConfig:
+    variant: str = "12p"
+    models: list[str] = field(default_factory=lambda: ["mock"])
+    guard: str = "L1+L2+L3"
+    playbook: str = "static"
+    human_seats: list[int] = field(default_factory=list)
+    turn_seconds: float | None = 300.0
+    max_tokens: int = 6_000_000
+    xray: bool = False
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> TableConfig:
+        known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
+        return cls(**known)
+
+
+@dataclass
+class Event:
+    seq: int
+    kind: str
+    data: dict
+    ts: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {"seq": self.seq, "kind": self.kind, "ts": round(self.ts, 3), **self.data}
+
+
+class Table:
+    def __init__(self, game_id: str, seed: int, cfg: TableConfig, env_keys: dict | None = None,
+                 created: float | None = None):
+        self.id = game_id
+        self.seed = seed
+        self.cfg = cfg
+        self.env_keys = env_keys or {}
+        self.created = created or time.time()
+        self.n = VARIANTS[cfg.variant].num_players
+        self.human_seats = [s for s in cfg.human_seats if 1 <= s <= self.n]
+        self.models = list(cfg.models) or ["mock"]
+        self.model_label = self.models[0] if len(self.models) == 1 else "混合"
+        self.env = Werewolf(cfg.variant, playbook_mode=cfg.playbook)
+        self.ledger = StepLedger(game=game_id)
+        self.journal: list[Record] = []
+        self.request_ids: dict[str, int] = {}       # client retry key -> seq
+        self.events: list[Event] = []
+        self.traces: dict[int, list[dict]] = {}
+        self.turn: Turn | Terminal | None = None
+        self.acting: dict | None = None
+        self.pending: Pending | None = None          # a human seat's open turn
+        self.pending_seat: int | None = None
+        self.memory: dict[int, tuple[dict, str]] = {}   # model seat -> (belief snapshot, note)
+        self.state = "waiting" if self.human_seats else "running"
+        self.outcome: dict | None = None
+        self.error: str | None = None
+        self.resumed_from: str | None = None
+        self.seat_stats: dict[int, dict] = {s: {"turns": 0, "forced": 0} for s in range(1, self.n + 1)}
+        self.stale_results = 0
+        self.recoveries = 0
+
+        # Which model sits where: round-robin over a seeded shuffle (as before), so a
+        # mixed table does not always hand seat 1 the same model.
+        ai = [s for s in range(1, self.n + 1) if s not in self.human_seats]
+        rota = list(self.models)
+        random.Random(seed).shuffle(rota)
+        self.seat_models: dict[int, str] = {s: rota[i % len(rota)] for i, s in enumerate(ai)}
+
+        guards = tuple(x for x in cfg.guard.split("+") if x and x != "无")
+        self.guard = GuardStack(guards)
+        self.transport = TransportBudget()
+        self.tokens = TokenBudget(max_tokens=cfg.max_tokens)
+
+    # ------------------------------------------------------------ seats
+    def seat_kind(self, seat: int) -> str:
+        if seat in self.human_seats:
+            return "human"
+        return "script" if self.seat_models.get(seat) == "script" else "llm"
+
+    def seat_rows(self) -> list[tuple[int, str, str | None]]:
+        return [(s, self.seat_kind(s), self.seat_models.get(s)) for s in range(1, self.n + 1)]
+
+    def make_player(self, seat: int, client_factory=None, on_step=None):
+        """A fresh player object for one turn. Model seats keep nothing between
+        turns: their memory travels in and out with the job (see agents.py)."""
+        model = self.seat_models[seat]
+        if model == "script":
+            return RandomPlayer(self.seed * 100 + seat)
+        client = (client_factory or self.client_for)(model, seat)
+        pol = RecoveryPolicy(timeout_s=profile(model)["timeout_s"])
+        return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=self.transport,
+                         token_budget=self.tokens, playbook=self.cfg.playbook != "none",
+                         on_step=on_step)
+
+    def client_for(self, model: str, seat: int):
+        if model == "mock":
+            return MockClient(seed=self.seed * 100 + seat)
+        return _provider_client(model, self.seed * 100 + seat, self.env_keys)
+
+    # ------------------------------------------------------------ world
+    def reset(self) -> None:
+        self.turn = self.env.reset(self.seed)
+
+    def apply(self, action: Any, forced: bool) -> tuple[Record, list[str]]:
+        """Advance the world by one step. Only the actor calls this, after the journal write."""
+        assert isinstance(self.turn, Turn)
+        before = self._snap()
+        record, self.turn = self.ledger.apply(self.env, self.turn, action, forced=forced)
+        self.journal.append(record)
+        st = self.seat_stats.setdefault(record.actor, {"turns": 0, "forced": 0})
+        st["turns"] += 1
+        st["forced"] += int(forced)
+        return record, self._news(before)
+
+    def fingerprint(self) -> str:
+        """A digest of the world as every seat sees it. Two tables with the same
+        seed and journal must agree; used by the determinism check."""
+        import hashlib
+        import json
+        views = {s: self.env.observe(s) for s in range(1, self.n + 1)} if isinstance(self.turn, Turn) else {}
+        body = json.dumps({"turn": repr(self.turn), "views": views}, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(body.encode()).hexdigest()[:16]
+
+    # ------------------------------------------------------------ events
+    def emit(self, kind: str, **data) -> Event:
+        ev = Event(len(self.events), kind, data)
+        self.events.append(ev)
+        return ev
+
+    def public_actor(self, turn: Turn) -> int | None:
+        return turn.actor if turn.task in PUBLIC_TASKS else None
+
+    def phase_event(self) -> Event:
+        t = self.turn
+        assert isinstance(t, Turn)
+        return self.emit("phase", phase=self.env._phase, round=self.env._round,
+                         actor=self.public_actor(t), task=t.task if t.task in PUBLIC_TASKS else "hidden",
+                         human=(t.actor in self.human_seats) if t.task in PUBLIC_TASKS else None)
+
+    def step_events(self, record: Record, news: list[str]) -> None:
+        public = record.task in PUBLIC_TASKS
+        self.emit("turn", actor=record.actor if public else None, task=record.task if public else "hidden",
+                  action=public_action(record.action) if public else None, forced=record.forced if public else None,
+                  n=len(self.journal), alive=sorted(self.env._alive), round=self.env._round, phase=self.env._phase)
+        for line in news:
+            self.emit("news", text=line)
+
+    # ------------------------------------------------------------ news (public facts only)
+    def _snap(self) -> dict:
+        e = self.env
+        return {"dead": {d.player_id for d in e._deaths}, "round": e._round, "phase": e._phase,
+                "exiles": dict(e._exiles), "sheriff": e._sheriff}
+
+    def _news(self, before: dict) -> list[str]:
+        e = self.env
+        out: list[str] = []
+        fresh = [d for d in e._deaths if d.player_id not in before["dead"]]
+        for d in fresh:
+            how = {"vote": "被放逐", "hunter": "被猎人带走", "detonate": "自爆"}.get(d.cause, "夜里出局")
+            out.append(f"第 {d.round} 轮：{d.player_id} 号{how}。")
+        for r, ex in e._exiles.items():
+            if r not in before["exiles"]:
+                counts: dict = {}
+                for _v, t in (e._votes.get(r) or {}).items():
+                    counts[t] = counts.get(t, 0) + 1
+                tally = "、".join(f"{t} 号 {n} 票" for t, n in sorted(counts.items(), key=lambda x: -x[1])) or "无人投票"
+                out.append(f"第 {r} 轮票型：{tally} → " + (f"{ex} 号出局。" if ex is not None else "平票，无人出局。"))
+        if before["phase"] != e._phase and e._phase == "day_speech" and not fresh:
+            out.append(f"第 {e._round} 天天亮：平安夜，没有人死。")
+        if before["phase"] != e._phase and e._phase == "review":
+            side = "狼人阵营" if e._winner == "werewolf" else "好人阵营"
+            out.append(f"本局结束：{side}获胜。全场底牌公开，开始复盘。")
+        if before["sheriff"] != e._sheriff and e._sheriff:
+            out.append(f"{e._sheriff} 号当选警长。")
+        return out
+
+    # ------------------------------------------------------------ reads
+    def reviewing(self) -> bool:
+        return getattr(self.env, "_phase", None) == "review"
+
+    def may_see_all(self, seat: int | None) -> bool:
+        """The only door to roles and thoughts: game over / in review, this seat is
+        out of the game, or the table was opened in 测试模式 (xray)."""
+        if self.cfg.xray or self.state in ("over", "aborted", "crashed") or self.reviewing():
+            return True
+        if seat and hasattr(self.env, "_alive") and self.env._alive:
+            return seat not in self.env._alive
+        return False
+
+    def acting_view(self, seat: int | None) -> dict | None:
+        a = self.acting
+        if not a:
+            return None
+        if a["task"] not in PUBLIC_TASKS and not self.may_see_all(seat) and a["actor"] != seat:
+            return {"actor": None, "task": "hidden", "human": None, "model": None,
+                    "seconds": round(time.time() - a["since"], 1), "steps": []}
+        return {"actor": a["actor"], "task": a["task"], "human": a["human"], "model": a["model"],
+                "seconds": round(time.time() - a["since"], 1), "steps": list(a.get("steps") or [])}
+
+    def health(self) -> dict:
+        turns = len(self.journal)
+        forced = sum(r.forced for r in self.journal)
+        by_model: dict[str, dict] = {}
+        for seat, m in self.seat_models.items():
+            row = by_model.setdefault(m, {"seats": [], "turns": 0, "forced": 0})
+            row["seats"].append(seat)
+            row["turns"] += self.seat_stats[seat]["turns"]
+            row["forced"] += self.seat_stats[seat]["forced"]
+        return {"by_model": by_model, "turns": turns, "forced": forced,
+                "forced_rate": round(forced / turns, 4) if turns else 0.0,
+                "usable": (forced / turns if turns else 0) <= 0.05,
+                "replays": self.ledger.replays, "stale_results": self.stale_results,
+                "recoveries": self.recoveries, "transport_failures": self.transport.failures,
+                "tokens": self.tokens.total_tokens, "max_tokens": self.tokens.max_tokens,
+                "gateway_drift": self.tokens.drift()}
+
+    def summary(self, seat: int | None = None) -> dict:
+        alive = sorted(self.env._alive) if hasattr(self.env, "_alive") else []
+        rnd, phase = getattr(self.env, "_round", 0), getattr(self.env, "_phase", "-")
+        return {"id": self.id, "variant": self.cfg.variant, "model": self.model_label, "models": self.models,
+                "seat_models": self.seat_models, "guard": self.cfg.guard, "playbook": self.cfg.playbook,
+                "state": self.state, "seed": self.seed, "seats": self.n, "human_seats": self.human_seats,
+                "alive": alive, "round": rnd, "phase": phase, "reviewing": phase == "review",
+                "outcome": self.outcome, "error": self.error, "xray": self.cfg.xray,
+                "acting": self.acting_view(seat), "resumed_from": self.resumed_from,
+                "health": self.health(), "created": round(self.created, 3), "version": len(self.journal)}
+
+    def spectator_view(self) -> dict:
+        v = dict(self.env.observe(1))
+        v.pop("private", None)
+        v.pop("night", None)
+        v["role"] = None
+        v["you"] = None
+        return v
+
+    def me(self, seat: int) -> dict:
+        p = self.pending if self.pending_seat == seat else None
+        st = self.seat_stats.get(seat, {"turns": 0, "forced": 0})
+        return {"seat": seat, "waiting": p is not None, "turn": p.to_dict() if p else None,
+                "turn_seconds": self.cfg.turn_seconds, "forced": st["forced"], "turns": st["turns"]}
+
+    def seat_state(self, seat: int | None) -> dict:
+        """What one client may know. `seat` must already be authenticated by the caller."""
+        out: dict[str, Any] = {"game": self.summary(seat), "seat": seat, "acting": self.acting_view(seat)}
+        if self.may_see_all(seat):
+            out["revealed"] = dict(self.env._roles) if hasattr(self.env, "_roles") else {}
+            out["traces"] = {str(k): v[-12:] for k, v in self.traces.items()}
+        out["review"] = self.env.review_log() if hasattr(self.env, "review_log") else []
+        if hasattr(self.env, "_alive") and self.env._alive:
+            out["view"] = self.env.observe(seat) if seat and 1 <= seat <= self.n else self.spectator_view()
+        if seat in self.human_seats:
+            out["me"] = self.me(seat)
+        out["log"] = [e.to_dict() for e in self.events[-60:]]
+        return out
+
+    def full_log(self, seat: int | None = None) -> dict:
+        wide = self.may_see_all(seat)
+        pub = self.spectator_view()["public"] if hasattr(self.env, "_alive") and self.env._alive else {}
+        journal = [{"n": i + 1, "actor": r.actor, "task": r.task,
+                    "action": r.action if wide else public_action(r.action),
+                    "forced": r.forced, "model": self.seat_models.get(r.actor, "真人")}
+                   for i, r in enumerate(self.journal)
+                   if wide or r.task in PUBLIC_TASKS or r.actor == seat]
+        over = self.state in ("over", "aborted", "crashed") or self.reviewing()
+        return {"game": self.summary(seat), "public": pub, "journal": journal,
+                "traces": ({str(k): v for k, v in self.traces.items()} if wide else {}),
+                "news": [e.to_dict() for e in self.events if e.kind == "news"],
+                "review": self.env.review_log() if hasattr(self.env, "review_log") else [],
+                "revealed": dict(self.env._roles) if over else None}

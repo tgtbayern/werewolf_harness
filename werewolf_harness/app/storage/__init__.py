@@ -1,3 +1,3 @@
-from .db import Store, Fenced, DuplicateStep
+from .db import DuplicateStep, Fenced, Store
 
 __all__ = ["Store", "Fenced", "DuplicateStep"]
