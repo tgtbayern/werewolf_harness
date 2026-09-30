@@ -31,6 +31,15 @@ from .leaderboard import Leaderboard
 from .limits import SlidingWindow, TokenBucket
 
 WEB = pathlib.Path(__file__).resolve().parents[2] / "web"
+
+
+class FastJSON(JSONResponse):
+    """Plain json.dumps. Returning a dict makes FastAPI walk it with jsonable_encoder
+    first -- profiling the load test found that walk to be the single largest CPU
+    cost of the API process (about 11x slower than json.dumps on a seat state)."""
+
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=False, default=str, separators=(",", ":")).encode()
 DEFAULT_MAX_TOKENS = 6_000_000
 log = olog.get("api")
 
@@ -59,7 +68,7 @@ def build_runtime(settings: Settings, store: Store, redis: Redis, env_keys: dict
                        on_commit=lambda t, ms: metrics.COMMIT_MS.observe(ms),
                        on_stale=lambda t: metrics.STALE_RESULTS.inc())
     from ..llm.gateway import Hub
-    hub = Hub(settings.redis_url, env_keys=env_keys)
+    hub = Hub(settings.redis_url, env_keys=env_keys, tpm=settings.llm_tpm, default_tpm=settings.llm_default_tpm)
     if executor is None and settings.agent_executor == "streams":
         from ..llm.queue import StreamExecutor
         executor = StreamExecutor(redis, settings)
@@ -76,6 +85,11 @@ def create_app(settings: Settings | None = None, *, migrate_on_start: bool = Tru
     async def lifespan(app: FastAPI):
         olog.setup(os.environ.get("LOG_LEVEL", "INFO"))
         tracing.setup("werewolf-api")
+        prof = os.environ.get("PROFILE_OUT")          # load-test profiling: yappi sees every thread
+        if prof:
+            import yappi
+            yappi.set_clock_type("cpu")
+            yappi.start()
         if migrate_on_start:
             await migrate.aupgrade(settings.database_url)
         store = Store.connect(settings.database_url)
@@ -93,8 +107,13 @@ def create_app(settings: Settings | None = None, *, migrate_on_start: bool = Tru
             await rt.shutdown(drain=True)
             await store.close()
             await redis.aclose()
+            if prof:
+                yappi.stop()
+                with open(prof, "w") as f:  # noqa: ASYNC230 -- once, at shutdown
+                    yappi.get_func_stats().sort("tsub").print_all(out=f, columns={
+                        0: ("name", 90), 1: ("ncall", 10), 2: ("tsub", 8), 3: ("ttot", 8), 4: ("tavg", 8)})
 
-    app = FastAPI(title="werewolf_harness", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="werewolf_harness", version="0.2.0", lifespan=lifespan, default_response_class=FastJSON)
     _routes(app)
     return app
 
@@ -232,7 +251,7 @@ def _routes(app: FastAPI) -> None:
                         "xray": cfg.get("xray", False), "node": g["owner_node"],
                         "health": {"turns": 0, "forced_rate": 0, "usable": True, "forced": 0, "tokens": 0},
                         "created": g["created_at"].timestamp()})
-        return {"games": sorted(out, key=lambda x: -x.get("created", 0))}
+        return FastJSON({"games": sorted(out, key=lambda x: -x.get("created", 0))})
 
     @app.post("/api/games", status_code=201)
     async def create(request: Request, body: dict, user: dict = Depends(current_user)):
@@ -292,13 +311,13 @@ def _routes(app: FastAPI) -> None:
         out = t.seat_state(me_seat)
         if seat is not None and me_seat is None:
             out["need_join"] = True                  # asked for a seat without that seat's token: spectator view
-        return out
+        return FastJSON(out)
 
     @app.get("/api/games/{gid}/log")
     async def full_log(request: Request, gid: str, seat: int | None = None, token: str | None = None,
                        authorization: str | None = Header(None)):
         t = await _table(request, gid)
-        return t.full_log(seat_from(request, gid, seat, authorization, token))
+        return FastJSON(t.full_log(seat_from(request, gid, seat, authorization, token)))
 
     def _local(request: Request, gid: str):
         a = svc(request).rt.get(gid)
@@ -319,7 +338,7 @@ def _routes(app: FastAPI) -> None:
         if seat_from(request, gid, seat, authorization, None) is None:
             raise HTTPException(403, "this seat is not yours")
         a = _local(request, gid)
-        return await a.submit(seat, int(body["seq"]), body["action"], body.get("request_id"))
+        return FastJSON(await a.submit(seat, int(body["seq"]), body["action"], body.get("request_id")))
 
     @app.get("/api/games/{gid}/events")
     async def sse(request: Request, gid: str, after: int = 0):

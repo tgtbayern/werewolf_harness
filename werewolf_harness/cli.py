@@ -103,6 +103,14 @@ def cmd_random(a: argparse.Namespace) -> int:
 
 
 def cmd_serve(a: argparse.Namespace) -> int:
+    """The online service (needs Postgres + Redis: `make dev`)."""
+    import uvicorn
+    uvicorn.run("werewolf_harness.app.api.main:app", host=a.host, port=a.port)
+    return 0
+
+
+def cmd_serve_legacy(a: argparse.Namespace) -> int:
+    """The original single-process server: standard library only, games live in memory."""
     from .server import serve
     serve(a.host, a.port)
     return 0
@@ -205,9 +213,12 @@ def main(argv: list[str] | None = None) -> int:
     rd.add_argument("--variant", default="12p", choices=sorted(VARIANTS))
     rd.add_argument("--seeds", type=int, default=10)
     rd.add_argument("--playbook", default="static", choices=["none", "static", "dynamic"])
-    sv = sub.add_parser("serve", help="开一个本地服务，用浏览器坐进去玩")
+    sv = sub.add_parser("serve", help="在线服务（Postgres + Redis），用浏览器坐进去玩")
     sv.add_argument("--host", default="127.0.0.1")
     sv.add_argument("--port", type=int, default=8402)
+    sl = sub.add_parser("serve-legacy", help="旧的单进程服务（标准库，不持久化）")
+    sl.add_argument("--host", default="127.0.0.1")
+    sl.add_argument("--port", type=int, default=8402)
     rs = sub.add_parser("resume", help="从存下来的日志接着跑一局被中断的游戏")
     rs.add_argument("file")
     rs.add_argument("--host", default="127.0.0.1")
@@ -218,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("--timeout", type=float, default=60.0)
     a = p.parse_args(argv)
     return {"play": cmd_play, "replay": cmd_replay, "random": cmd_random,
-            "serve": cmd_serve, "providers": cmd_providers, "resume": cmd_resume}[a.cmd](a)
+            "serve": cmd_serve, "serve-legacy": cmd_serve_legacy, "providers": cmd_providers, "resume": cmd_resume}[a.cmd](a)
 
 
 if __name__ == "__main__":

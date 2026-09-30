@@ -28,6 +28,7 @@ un-serialisable crosses the wire and a job can never act on a world that moved o
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import socket
@@ -119,6 +120,9 @@ class Worker:
         self.s, self.store, self.r, self.hub = settings, store, redis, hub
         self.consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
         self.sem = asyncio.Semaphore(concurrency)
+        # its own pool: asyncio.to_thread's default pool is min(32, cpus + 4) threads, which
+        # load testing found capping a 2-core worker at ~6 turns in flight (~8 commits/s)
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="turn")
         self.env_keys = env_keys or {}
         self.claim_idle_ms = claim_idle_ms or int(settings.agent_timeout_s * 1000)
         self.max_deliveries = max_deliveries
@@ -159,6 +163,7 @@ class Worker:
         self._stop = True
         for t in list(self._tasks):
             t.cancel()
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
     async def _next(self):
         # strict priority: look at each lane without blocking, highest first...
@@ -213,7 +218,7 @@ class Worker:
                        tuple(mem) if mem else None,
                        make_player=lambda on_step: table.make_player(seat, task=t.task, version=version),
                        trace_ctx=tracing.from_carrier(json.loads(f["tp"])) if f.get("tp") else None)
-        res = await asyncio.to_thread(run_agent_turn, job)
+        res = await asyncio.get_running_loop().run_in_executor(self.pool, run_agent_turn, job)
         self.done += 1
         res.meta["remote"] = True
         res.meta["worker"] = self.consumer
@@ -258,10 +263,15 @@ async def main() -> None:
     from .gateway import Hub
     s = get_settings()
     olog.setup()
+    tracing.setup("worker")
+    if os.environ.get("WORKER_METRICS_PORT"):
+        from prometheus_client import start_http_server
+        start_http_server(int(os.environ["WORKER_METRICS_PORT"]))
     store = Store.connect(s.database_url)
     r = Redis.from_url(s.redis_url)
     env = read_env()
-    w = Worker(s, store, r, Hub(s.redis_url, env_keys=env), concurrency=s.agent_workers, env_keys=env)
+    hub = Hub(s.redis_url, env_keys=env, tpm=s.llm_tpm, default_tpm=s.llm_default_tpm)
+    w = Worker(s, store, r, hub, concurrency=s.agent_workers, env_keys=env)
     log.info("worker %s up", w.consumer)
     try:
         await w.run()

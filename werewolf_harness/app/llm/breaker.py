@@ -29,6 +29,7 @@ class Breaker:
         self._probe_inflight = 0
         self._probe_ok = 0
         self._events: deque[tuple[float, bool]] = deque()
+        self._fails = 0                  # failures currently in the window (kept incrementally: O(1) per call)
         self._lock = threading.Lock()
         self.transitions: list[tuple[str, str]] = []
 
@@ -62,12 +63,15 @@ class Breaker:
                 if self._probe_ok >= self.probes:
                     self._move("closed")
                     self._events.clear()
+                    self._fails = 0
                 return
             self._events.append((now, ok))
+            self._fails += 0 if ok else 1
             while self._events and now - self._events[0][0] > self.window_s:
-                self._events.popleft()
+                _, good = self._events.popleft()
+                self._fails -= 0 if good else 1
             n = len(self._events)
-            fails = sum(1 for _, good in self._events if not good)
+            fails = self._fails
             if self.state == "closed" and n >= self.min_calls and fails / n >= self.threshold:
                 self._move("open")
                 self.opened_at = now

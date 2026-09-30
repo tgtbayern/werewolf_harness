@@ -1,0 +1,10 @@
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+games
+resume
+loadtest/results
+*.html
+!web/*.html
+.env

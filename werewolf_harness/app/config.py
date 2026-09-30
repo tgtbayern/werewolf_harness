@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     agent_executor: str = "local"       # local | streams
     agent_workers: int = 16
     daily_budget_usd: float = 5.0
+    # tokens per minute per model, as the provider grants them; {"gpt-x": 800000, ...}
+    llm_tpm: dict[str, int] = {}
+    llm_default_tpm: int = 2_000_000
 
     # api
     rate_limit_per_min: int = 240       # per IP, all routes

@@ -112,10 +112,10 @@ class Hub:
 
     def __init__(self, redis_url: str, *, env_keys: dict | None = None, tpm: dict[str, int] | None = None,
                  sink: CallSink | None = None, breaker_kw: dict | None = None, sim_sleep: bool = True,
-                 limiter_wait_s: float = 10.0):
+                 limiter_wait_s: float = 10.0, default_tpm: int = 2_000_000):
         self.r = redis_sync.Redis.from_url(redis_url)
         self.env_keys = env_keys or {}
-        self.limiter = TokenLimiter(self.r, tpm or {})
+        self.limiter = TokenLimiter(self.r, tpm or {}, default_tpm)
         self.budget = GameBudget(self.r)
         self.sink = sink or CallSink()
         self.breaker_kw = breaker_kw or {}
@@ -215,9 +215,12 @@ class GatewayClient(LLMClient):
             metrics.BREAKER_STATE.labels(provider=model).set(1 if br.state == "open" else 0)
             cached = cached_tokens_of(resp)
             used = resp.prompt_tokens + resp.completion_tokens
-            self.hub.limiter.settle(model, want, used)
+            # settle the reservation and charge the game in one round trip
+            pipe = self.hub.r.pipeline(transaction=False)
+            self.hub.limiter.settle(model, want, used, pipe=pipe)
             if self.game_id:
-                self.hub.budget.add(self.game_id, used)
+                self.hub.budget.add(self.game_id, used, pipe=pipe)
+            pipe.execute()
             usd = pricing.cost(model, resp.prompt_tokens, cached, resp.completion_tokens)
             fb = reason if i > 0 else None
             self._record(model, "ok", input_tokens=resp.prompt_tokens, cached_tokens=cached,

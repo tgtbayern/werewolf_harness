@@ -68,9 +68,9 @@ class TokenLimiter:
                 return False
             time.sleep(min(wait_ms / 1000, 1.0))
 
-    def settle(self, key: str, reserved: int, used: int) -> None:
+    def settle(self, key: str, reserved: int, used: int, pipe=None) -> None:
         if reserved > used:
-            self._give(keys=[f"tpm:{key}"], args=[self._cap(key), reserved - used])
+            self._give(keys=[f"tpm:{key}"], args=[self._cap(key), reserved - used], client=pipe)
 
 
 class GameBudget:
@@ -82,8 +82,9 @@ class GameBudget:
     def spent(self, game_id: str) -> int:
         return int(self.r.get(f"budget:{game_id}") or 0)
 
-    def add(self, game_id: str, tokens: int) -> int:
-        pipe = self.r.pipeline()
-        pipe.incrby(f"budget:{game_id}", tokens)
-        pipe.expire(f"budget:{game_id}", 7 * 24 * 3600)
-        return int(pipe.execute()[0])
+    def add(self, game_id: str, tokens: int, pipe=None) -> None:
+        p = pipe if pipe is not None else self.r.pipeline()
+        p.incrby(f"budget:{game_id}", tokens)
+        p.expire(f"budget:{game_id}", 7 * 24 * 3600)
+        if pipe is None:
+            p.execute()

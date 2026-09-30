@@ -36,7 +36,7 @@ def setup(service: str = "werewolf-api", exporter=None) -> TracerProvider | None
     endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
     if exporter is None and not endpoint:
         return None
-    provider = TracerProvider(resource=Resource.create({"service.name": service}))
+    provider = TracerProvider(resource=Resource.create({"service.name": os.environ.get("OTEL_SERVICE_NAME", service)}))
     if exporter is not None:
         provider.add_span_processor(SimpleSpanProcessor(exporter))
     else:

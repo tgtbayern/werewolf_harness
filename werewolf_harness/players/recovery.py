@@ -17,6 +17,7 @@ one of the reported numbers (axis 4).
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import contextvars
 import time
 from dataclasses import dataclass, field
@@ -170,7 +171,11 @@ def call_model(client, messages, tools, *, policy: RecoveryPolicy, stats: Recove
     return None
 
 
-_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="model-call")
+# Every model call in the process goes through this pool (for the hard deadline), so
+# its size is a process-wide cap on concurrent model calls. The online service raises it
+# (MODEL_CALL_THREADS); load testing found 32 capping throughput at ~100 calls/s.
+_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("MODEL_CALL_THREADS", "32")),
+                                              thread_name_prefix="model-call")
 
 
 def _with_deadline(fn, seconds: float):
