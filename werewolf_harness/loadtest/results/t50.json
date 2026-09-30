@@ -1,0 +1,29 @@
+{
+  "tables": 50,
+  "started": 50,
+  "finished": 0,
+  "acts": 73,
+  "push_ms": {
+    "p50": 2.1,
+    "p95": 87.5,
+    "p99": 173.7,
+    "n": 840
+  },
+  "get_ms": {
+    "p50": 9.3,
+    "p95": 63.0,
+    "p99": 109.7,
+    "n": 387
+  },
+  "ack_ms": {
+    "p50": 7.8,
+    "p95": 27.9,
+    "p99": 89.7,
+    "n": 73
+  },
+  "errors": {},
+  "server_cpu_avg_pct": 35.3,
+  "server_cpu_max_pct": 36.2,
+  "server_rss_max_mb": 159.5,
+  "client_cpu_avg_pct": 23.5
+}
