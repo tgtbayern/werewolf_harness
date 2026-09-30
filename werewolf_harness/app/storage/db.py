@@ -222,7 +222,8 @@ class Store:
                 "SELECT count(*) AS calls, coalesce(sum(input_tokens),0) AS input, coalesce(sum(cached_tokens),0) AS cached, "
                 "coalesce(sum(output_tokens),0) AS output, coalesce(sum(cost_usd),0) AS cost, "
                 "percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms, "
-                f"count(*) FILTER (WHERE fallback_reason IS NOT NULL) AS fallbacks FROM llm_calls {where}"),
+                "count(*) FILTER (WHERE status = 'ok' AND fallback_reason IS NOT NULL) AS fallbacks, "
+                f"count(*) FILTER (WHERE status <> 'ok') AS failed FROM llm_calls {where}"),
                 {"g": game_id})).mappings().first()
         d = dict(r)
         d["cache_hit_rate"] = round(float(d["cached"]) / float(d["input"]), 4) if d["input"] else 0.0

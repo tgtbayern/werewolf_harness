@@ -43,4 +43,5 @@ ignore = ["E501", "B008"]
 "players/*" = ["ALL"]
 "server/*" = ["ALL"]
 "tests/test_*.py" = ["ALL"]
+"scripts/*" = ["ASYNC110"]  # benches poll on purpose
 "*.py" = []

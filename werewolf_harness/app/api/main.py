@@ -22,7 +22,7 @@ from ...server.http import read_env
 from ..auth import tokens
 from ..config import Settings, get_settings
 from ..obs import logging as olog
-from ..obs import metrics
+from ..obs import metrics, tracing
 from ..runtime.actor import ActorHooks
 from ..runtime.runtime import Runtime
 from ..runtime.table import Table, TableConfig
@@ -75,6 +75,7 @@ def create_app(settings: Settings | None = None, *, migrate_on_start: bool = Tru
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         olog.setup(os.environ.get("LOG_LEVEL", "INFO"))
+        tracing.setup("werewolf-api")
         if migrate_on_start:
             await migrate.aupgrade(settings.database_url)
         store = Store.connect(settings.database_url)

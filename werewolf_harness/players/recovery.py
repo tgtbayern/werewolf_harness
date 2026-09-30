@@ -17,6 +17,7 @@ one of the reported numbers (axis 4).
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import time
 from dataclasses import dataclass, field
 
@@ -180,7 +181,8 @@ def _with_deadline(fn, seconds: float):
     a worker thread; past the deadline the thread is abandoned (it dies with
     its socket) and the turn is treated as a transport timeout.
     """
-    future = _POOL.submit(fn)
+    # carry the caller's contextvars (trace context, log fields) into the pool thread
+    future = _POOL.submit(contextvars.copy_context().run, fn)
     try:
         return future.result(timeout=seconds)
     except concurrent.futures.TimeoutError as exc:

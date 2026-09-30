@@ -30,6 +30,7 @@ from ...players.providers.base import LLMClient, LLMResponse, ProviderError
 from ...players.providers.mock import MockClient
 from ...players.recovery import is_terminal_refusal
 from ..obs import metrics
+from ..obs.tracing import get_tracer
 from . import pricing
 from .breaker import Breaker
 from .limits import GameBudget, TokenLimiter
@@ -176,9 +177,16 @@ class GatewayClient(LLMClient):
                 self._record(model, "rejected", fallback_reason="rate_limited_local")
                 continue
             t0 = time.monotonic()
+            span = get_tracer().start_span(f"chat {model}", attributes={
+                "gen_ai.operation.name": "chat", "gen_ai.system": _provider(model), "gen_ai.request.model": model,
+                "gen_ai.request.max_tokens": max_tokens, "game.id": self.game_id or "", "game.seat": self.seat or 0,
+                "llm.fallback_index": i})
             try:
                 resp = client.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
             except ProviderError as exc:
+                span.set_attribute("error.type", classify(exc) or "client_error")
+                span.set_status(_err_status(str(exc)))
+                span.end()
                 ms = int((time.monotonic() - t0) * 1000)
                 self.hub.limiter.settle(model, want, 0)
                 if is_terminal_refusal(exc):
@@ -196,6 +204,13 @@ class GatewayClient(LLMClient):
                 metrics.LLM_CALL_MS.labels(model=model, status="error").observe(ms)
                 continue
             ms = int((time.monotonic() - t0) * 1000)
+            cached_now = cached_tokens_of(resp)
+            span.set_attribute("gen_ai.usage.input_tokens", resp.prompt_tokens)
+            span.set_attribute("gen_ai.usage.output_tokens", resp.completion_tokens)
+            span.set_attribute("gen_ai.usage.cached_input_tokens", cached_now)
+            if reason:
+                span.set_attribute("llm.fallback_reason", reason)
+            span.end()
             br.record(True)
             metrics.BREAKER_STATE.labels(provider=model).set(1 if br.state == "open" else 0)
             cached = cached_tokens_of(resp)
@@ -216,6 +231,11 @@ class GatewayClient(LLMClient):
                 metrics.LLM_FALLBACKS.labels(reason=fb).inc()
             return resp
         raise ProviderError(f"every model in the chain failed ({reason})", status=503)
+
+
+def _err_status(msg: str):
+    from opentelemetry.trace import Status, StatusCode
+    return Status(StatusCode.ERROR, msg[:200])
 
 
 def _provider(model: str) -> str:

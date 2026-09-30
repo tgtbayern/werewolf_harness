@@ -32,6 +32,7 @@ from ...arena import Terminal, Turn
 from ...players.human import Pending
 from ...server.service import _in_plain_words
 from ..obs import logging as olog
+from ..obs import tracing
 from ..storage import DuplicateStep, Fenced, Store
 from .agents import AgentJob, AgentResult
 from .table import Table
@@ -98,6 +99,7 @@ class GameActor:
         self.stopped: str | None = None           # why the loop ended (fenced, shutdown, db, finished)
         self.stats = ActorStats()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._turn_span = None
 
     @property
     def id(self) -> str:
@@ -205,6 +207,11 @@ class GameActor:
                          "model": self.t.seat_models.get(turn.actor, "真人"), "steps": []}
         ev = self.t.phase_event()
         v = self.version
+        self._end_turn_span()
+        self._turn_span = tracing.get_tracer().start_span(
+            "turn", attributes={"game.id": self.id, "game.seat": turn.actor, "game.task": turn.task,
+                                "game.version": v, "game.seat_kind": "human" if human else "agent"})
+        turn_ctx = tracing.trace.set_span_in_context(self._turn_span)
         if human:
             secs = self.t.cfg.turn_seconds
             deadline = None if secs is None else time.time() + secs
@@ -217,7 +224,8 @@ class GameActor:
                            make_player=lambda on_step, s=turn.actor, task=turn.task, v=v:
                            self.t.make_player(s, on_step=on_step, task=task, version=v),
                            on_step=self._step_from_thread,
-                           lane=self.t.cfg.lane or ("human" if self.t.human_seats else "online"))
+                           lane=self.t.cfg.lane or ("human" if self.t.human_seats else "online"),
+                           trace_ctx=turn_ctx)
             self._arm(self.agent_timeout_s, TimerFired(v, "agent"))
             self.executor.submit(job, self.post)
         await self._notify(ev)
@@ -278,6 +286,24 @@ class GameActor:
         assert isinstance(turn, Turn)
         t0 = time.monotonic()
         delay = 0.2
+        span = tracing.get_tracer().start_span(
+            "commit", context=tracing.trace.set_span_in_context(self._turn_span) if self._turn_span else None,
+            attributes={"game.id": self.id, "game.seq": self.version, "game.forced": forced})
+        try:
+            ok = await self._commit_inner(action, forced, request_id, agent_states, memory, turn, t0, delay)
+        finally:
+            span.end()
+            self._end_turn_span()
+        if ok:
+            await self._prompt()          # the next turn gets its own span
+        return ok
+
+    def _end_turn_span(self) -> None:
+        if self._turn_span is not None:
+            self._turn_span.end()
+            self._turn_span = None
+
+    async def _commit_inner(self, action, forced, request_id, agent_states, memory, turn, t0, delay) -> bool:
         for attempt in range(7):
             try:
                 await self.store.append(self.id, token=self.token, seq=self.version, actor=turn.actor, task=turn.task,
@@ -318,7 +344,6 @@ class GameActor:
         # ③ publish
         self.t.step_events(record, news)
         await self._notify(None)
-        await self._prompt()
         return True
 
     async def _finish(self, term: Terminal) -> None:

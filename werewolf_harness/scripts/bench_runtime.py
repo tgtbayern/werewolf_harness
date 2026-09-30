@@ -21,8 +21,8 @@ from ..app.runtime.runtime import Runtime
 from ..app.runtime.table import TableConfig
 from ..app.storage import Store
 
-DB = os.environ.get("BENCH_DATABASE_URL", "postgresql+asyncpg://postgres@127.0.0.1:5432/wh_test")
-RD = os.environ.get("BENCH_REDIS_URL", "redis://127.0.0.1:6379/14")
+DB = os.environ.get("BENCH_DATABASE_URL", "postgresql+asyncpg://postgres@127.0.0.1:5432/wh_bench")
+RD = os.environ.get("BENCH_REDIS_URL", "redis://127.0.0.1:6379/13")
 
 
 def rss_mb() -> float:

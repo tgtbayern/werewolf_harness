@@ -39,7 +39,7 @@ from redis.asyncio import Redis
 from ...arena import Record, Turn
 from ..config import Settings
 from ..obs import logging as olog
-from ..obs import metrics
+from ..obs import metrics, tracing
 from ..runtime.agents import AgentJob, AgentResult, run_agent_turn
 from ..runtime.table import Table, TableConfig
 
@@ -83,7 +83,8 @@ class StreamExecutor:
         self.inflight += 1
         fields = {"game_id": job.game_id, "seat": job.seat, "version": job.version, "task": job.task,
                   "memory": json.dumps(job.memory, ensure_ascii=False) if job.memory else "",
-                  "reply_to": self.node, "enq": time.time(), "lane": job.lane}
+                  "reply_to": self.node, "enq": time.time(), "lane": job.lane,
+                  "tp": json.dumps(tracing.to_carrier(job.trace_ctx)) if job.trace_ctx is not None else ""}
         asyncio.get_running_loop().create_task(
             self.r.xadd(jobs_key(job.lane), fields, maxlen=100_000, approximate=True))
 
@@ -125,6 +126,7 @@ class Worker:
         self.stale = 0
         self.dead = 0
         self.order: list[str] = []          # lanes in the order jobs were taken (tests read this)
+        self.waits: dict[str, list[float]] = {x: [] for x in LANES}   # ms each job sat in the queue
         self._tasks: set[asyncio.Task] = set()
         self._stop = False
 
@@ -178,7 +180,9 @@ class Worker:
         try:
             f = {_s(k): _s(v) for k, v in raw.items()}
             self.order.append(lane)
-            metrics.QUEUE_WAIT_MS.labels(lane=lane).observe((time.time() - float(f["enq"])) * 1000)
+            wait_ms = (time.time() - float(f["enq"])) * 1000
+            self.waits.setdefault(lane, []).append(wait_ms)
+            metrics.QUEUE_WAIT_MS.labels(lane=lane).observe(wait_ms)
             reply = await self._run(f)
             if reply is not None:
                 await self.r.xadd(results_key(f["reply_to"]), {"r": json.dumps(reply, ensure_ascii=False, default=str)},
@@ -207,7 +211,8 @@ class Worker:
         mem = json.loads(f["memory"]) if f.get("memory") else None
         job = AgentJob(gid, seat, version, t.task, table.env.observe(seat), table.env.action_space(seat, t.task),
                        tuple(mem) if mem else None,
-                       make_player=lambda on_step: table.make_player(seat, task=t.task, version=version))
+                       make_player=lambda on_step: table.make_player(seat, task=t.task, version=version),
+                       trace_ctx=tracing.from_carrier(json.loads(f["tp"])) if f.get("tp") else None)
         res = await asyncio.to_thread(run_agent_turn, job)
         self.done += 1
         res.meta["remote"] = True

@@ -41,6 +41,7 @@ class AgentJob:
     on_step: Callable[[int, Any], None] | None = None
     max_retries: int = 3
     lane: str = "online"                      # human (a person is waiting) | online | offline
+    trace_ctx: Any = None                     # OpenTelemetry context of the turn span
 
 
 @dataclass
@@ -57,6 +58,23 @@ class AgentResult:
 
 def run_agent_turn(job: AgentJob) -> AgentResult:
     """Blocking: one seat's whole turn, retries included. Runs on a worker thread/process."""
+    from ..obs import tracing
+    token = tracing.attach(job.trace_ctx)
+    try:
+        with tracing.get_tracer().start_as_current_span(
+                "invoke_agent", attributes={"gen_ai.operation.name": "invoke_agent", "game.id": job.game_id,
+                                            "game.seat": job.seat, "game.task": job.task,
+                                            "game.version": job.version}) as span:
+            res = _run_agent_turn(job)
+            span.set_attribute("game.forced", res.forced)
+            if res.meta.get("rule_npc"):
+                span.set_attribute("game.rule_npc", True)
+            return res
+    finally:
+        tracing.detach(token)
+
+
+def _run_agent_turn(job: AgentJob) -> AgentResult:
     t0 = time.monotonic()
     player = job.make_player(job.on_step)
     llm = hasattr(player, "belief")
