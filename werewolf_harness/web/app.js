@@ -8,17 +8,44 @@
  */
 const $ = (s, r = document) => r.querySelector(s);
 const el = (tag, cls, txt) => { const n = document.createElement(tag); if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
+/* Who you are is a guest token (localStorage); which seat you hold in a game is a
+ * seat token the server hands out on /join. A seat's private view and its moves
+ * need the seat token -- the server no longer trusts `?seat=N` on its own. */
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* private mode: keep it in memory */ } },
+};
+const seatKey = (g, s) => `wh.seat.${g}.${s}`;
+const authFor = () => (state.game && state.seat && store.get(seatKey(state.game, state.seat))) || store.get("wh.user");
 const api = async (path, opts) => {
-  const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const headers = { "Content-Type": "application/json" };
+  const tok = (opts && opts.token) || authFor();
+  if (tok) headers.Authorization = `Bearer ${tok}`;
+  const r = await fetch(path, { headers, ...opts });
   return r.json();
 };
+
+async function ensureUser() {
+  if (store.get("wh.user")) return;
+  const r = await fetch("/api/auth/guest", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  const j = await r.json();
+  if (j.token) store.set("wh.user", j.token);
+}
+
+async function ensureSeat() {
+  if (!state.seat || store.get(seatKey(state.game, state.seat))) return;
+  const r = await api(`/api/games/${state.game}/join`, { method: "POST", token: store.get("wh.user"),
+    body: JSON.stringify({ seat: state.seat }) });
+  if (r.seat_token) store.set(seatKey(state.game, state.seat), r.seat_token);
+  else { state.notice = r.detail || "这个座位已经有人了，你在观战。"; state.seat = null; }
+}
 
 const state = {
   meta: null, games: [], filter: "all",
   form: { xray: false, variant: "8p", models: ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3",
             "claude-sonnet-5", "claude-opus-5"], guard: "L1+L2+L3", seat: 3, clock: 300 },
   game: null, seat: null, picked: null, draft: "", tool: null, args: {},
-  es: null, conn: "—", sending: false, feedTab: "say", log: null,
+  es: null, ws: null, conn: "—", sending: false, feedTab: "say", log: null, lastEv: -1, acks: {}, retry: 0,
   reviewSeen: false, sayRound: null, voteRound: null,
 };
 
@@ -26,7 +53,7 @@ const state = {
 function route() {
   const m = location.hash.match(/^#\/g\/([^/?]+)(?:\?seat=(\d+))?/);
   if (m) { state.game = m[1]; state.seat = m[2] ? +m[2] : null; openTable(); }
-  else { state.game = null; state.seat = null; openLobby(); }
+  else { state.game = null; state.seat = null; closeLive(); openLobby(); }
 }
 window.addEventListener("hashchange", route);
 
@@ -63,7 +90,7 @@ const MODEL_OFF = new Set();
 async function openLobby() {
   $("#lobby").hidden = false; $("#table").hidden = true;
   $("#nav-lobby").classList.add("on"); $("#nav-table").hidden = true;
-  if (state.es) { state.es.close(); state.es = null; }
+  closeLive();
   if (!state.meta) state.meta = await api("/api/meta");
   renderForm();
   await refreshGames();
@@ -169,6 +196,7 @@ function renderForm() {
 async function createGame() {
   const f = state.form;
   $("#create").disabled = true;
+  await ensureUser();
   const g = await api("/api/games", { method: "POST", body: JSON.stringify({
     variant: f.variant, models: f.models, guard: f.guard, playbook: "static", xray: f.xray,
     human_seats: [f.seat], turn_seconds: f.clock || null }) });
@@ -182,14 +210,67 @@ async function openTable() {
   $("#nav-lobby").classList.remove("on"); $("#nav-table").hidden = false; $("#nav-table").classList.add("on");
   $("#nav-table").href = location.hash;
   clearInterval(window._poll);
+  await ensureUser();
+  await ensureSeat();
   await pull();
-  if (state.es) state.es.close();
-  const es = new EventSource(`/api/games/${state.game}/events?after=0`);
-  state.es = es;
-  es.onopen = () => { state.conn = "已连"; };
-  es.onerror = () => { state.conn = "重连中"; renderHealth(); };
-  es.onmessage = () => { pull(); if (state.feedTab === "all") loadLog(); };
+  closeLive();
+  state.lastEv = -1;
+  connectLive();
   window._tick = window._tick || setInterval(tickClock, 1000);
+}
+
+/* One WebSocket per table. Heartbeat every hello.heartbeat_s (the first one after a
+ * random fraction of it, so a server restart does not bring every tab back in the
+ * same second); reconnect with capped exponential backoff and resume from the last
+ * event seq, so nothing is missed and nothing is shown twice. */
+function connectLive() {
+  const gid = state.game; if (!gid) return;
+  const tok = state.seat ? store.get(seatKey(gid, state.seat)) : "";
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/games/${gid}?token=${encodeURIComponent(tok || "")}&last_seq=${state.lastEv}`);
+  state.ws = ws;
+  ws.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.op === "hello") {
+      state.conn = "已连"; state.retry = 0; renderHealth();
+      const beat = () => { if (state.ws === ws && ws.readyState === 1) ws.send(JSON.stringify({ op: "ping", t: Date.now() })); };
+      clearTimeout(state.beatFirst); clearInterval(state.beat);
+      state.beatFirst = setTimeout(() => { beat(); state.beat = setInterval(beat, d.heartbeat_s * 1000); }, Math.random() * d.heartbeat_s * 1000);
+    } else if (d.op === "event") {
+      if (d.seq <= state.lastEv) return;
+      state.lastEv = d.seq;
+      pull(); if (state.feedTab === "all") loadLog();
+    } else if (d.op === "ack" && state.acks[d.request_id]) {
+      state.acks[d.request_id](d.result); delete state.acks[d.request_id];
+    }
+  };
+  ws.onclose = (e) => {
+    if (state.ws !== ws) return;
+    clearTimeout(state.beatFirst); clearInterval(state.beat);
+    state.conn = "重连中"; renderHealth();
+    if (e.code === 4404) { state.conn = "轮询"; clearInterval(window._poll); window._poll = setInterval(pull, 3000); return; }
+    const wait = Math.min(10000, 500 * 2 ** state.retry++) * (0.5 + Math.random());
+    setTimeout(() => { if (state.ws === ws && state.game === gid) connectLive(); }, wait);
+  };
+}
+
+function closeLive() {
+  const ws = state.ws; state.ws = null;
+  clearTimeout(state.beatFirst); clearInterval(state.beat);
+  if (ws) ws.close();
+}
+
+function sendAct(seq, action) {
+  const request_id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  const ws = state.ws;
+  if (ws && ws.readyState === 1) {
+    return new Promise((resolve) => {
+      state.acks[request_id] = resolve;
+      ws.send(JSON.stringify({ op: "act", seq, action, request_id }));
+      setTimeout(() => { if (state.acks[request_id]) { delete state.acks[request_id]; resolve({ status: "timeout" }); } }, 15000);
+    });
+  }
+  return api(`/api/games/${state.game}/act`, { method: "POST", body: JSON.stringify({ seat: state.seat, seq, action, request_id }) });
 }
 
 async function pull() {
@@ -915,8 +996,7 @@ async function submit(tool, seq) {
     if (k in state.args) args[k] = state.args[k];
     else if (p.type === "dict[int,str]") args[k] = defaultRoles();
   }
-  const r = await api(`/api/games/${state.game}/act`, { method: "POST", body: JSON.stringify({
-    seat: state.seat, seq, action: { name: tool.name, args } }) });
+  const r = await sendAct(seq, { name: tool.name, args });
   state.sending = false;
   if (r.status === "illegal") { state.s.me.turn.feedback = r.reason; renderTurn(true); return; }
   state.args = {}; state.tool = null; state.turnKey = null;

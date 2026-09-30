@@ -17,7 +17,7 @@ WEB = pathlib.Path(__file__).resolve().parent.parent / "web"
 GLOBALS = {
     "$", "el", "api", "fetch", "setTimeout", "setInterval", "clearInterval", "clearTimeout",
     "parseInt", "parseFloat", "String", "Number", "Boolean", "Object", "Array", "JSON", "Math",
-    "Date", "Promise", "Error", "Set", "Map", "RegExp", "EventSource", "URLSearchParams",
+    "Date", "Promise", "Error", "Set", "Map", "RegExp", "EventSource", "URLSearchParams", "WebSocket",
     "console", "document", "window", "location", "encodeURIComponent", "decodeURIComponent",
     "isNaN", "alert", "requestAnimationFrame", "structuredClone", "if", "for", "while", "switch",
     "catch", "return", "typeof", "function", "await", "new", "of", "in", "do", "else",

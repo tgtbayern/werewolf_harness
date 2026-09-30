@@ -68,7 +68,7 @@ async def redis():
 @pytest.fixture
 def settings():
     from werewolf_harness.app.config import Settings
-    return Settings(database_url=DB_URL, redis_url=REDIS_URL, jwt_secret="test-secret",
+    return Settings(database_url=DB_URL, redis_url=REDIS_URL, jwt_secret="test-secret-that-is-at-least-32-bytes-long",
                     lease_ttl_ms=1500, lease_renew_s=0.3, recovery_scan_s=0.3,
                     agent_timeout_s=5.0, human_turn_s=30.0)
 

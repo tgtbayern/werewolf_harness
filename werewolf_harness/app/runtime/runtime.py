@@ -106,6 +106,40 @@ class Runtime:
         actor.launch()
         return actor
 
+    async def import_log(self, log: dict, *, max_tokens: int | None = None, created_by: str | None = None) -> GameActor:
+        """Continue a game from an old JSON save (the pre-database format).
+
+        The saved journal is written into a new game's journal, then the game is
+        started exactly the way a recovered one is: replay, then ask the next turn.
+        """
+        g = log.get("game") or {}
+        records = [Record(r["actor"], r["task"], r["action"], bool(r.get("forced"))) for r in log.get("journal") or []]
+        if not records:
+            raise ValueError("这份日志里没有回合，直接重开就行")
+        if any(r.action is None or "name" not in (r.action or {}) for r in records):
+            raise ValueError("这份日志的动作不全（多半是没权限那半份），换一份完整的")
+        cfg = TableConfig(variant=g.get("variant", "12p"), models=list(g.get("models") or ["mock"]),
+                          guard=g.get("guard", "L1+L2+L3"), playbook=g.get("playbook", "static"),
+                          human_seats=list(g.get("human_seats") or []), turn_seconds=None,
+                          max_tokens=max_tokens or 6_000_000, xray=bool(g.get("xray")))
+        gid = "g" + secrets.token_hex(4)
+        table = Table(gid, int(g["seed"]), cfg, self.env_keys)
+        self.replay(table, records)                       # validate before writing anything
+        await self.store.create_game(game_id=gid, variant=cfg.variant, seed=table.seed, config=cfg.to_dict(),
+                                     state="running", seats=table.seat_rows(), created_by=created_by,
+                                     resumed_from=g.get("id", "存档"))
+        if not await self.leases.acquire(gid):
+            raise RuntimeError("could not take the lease on a brand-new game")
+        token = await self.store.bump_fencing(gid, self.node)
+        for i, r in enumerate(records):
+            await self.store.append(gid, token=token, seq=i, actor=r.actor, task=r.task, action=r.action, forced=r.forced)
+        table.state = "running"
+        table.resumed_from = g.get("id", "存档")
+        table.emit("phase", phase="resume", round=getattr(table.env, "_round", 0), turns=len(table.journal))
+        actor = self._actor(table, token)
+        actor.launch()
+        return actor
+
     def get(self, gid: str) -> GameActor | None:
         return self.actors.get(gid)
 

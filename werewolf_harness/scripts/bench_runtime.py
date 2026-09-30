@@ -60,7 +60,7 @@ async def adoption(samples: int = 20) -> dict:
             await a.start(scan=False)
             g = await a.create(TableConfig(variant="12p", models=["mock"]), seed=1000 + i)
             try:
-                await until(lambda: len(g.t.journal) >= cut or g.t.state == "over")
+                await until(lambda g=g, cut=cut: len(g.t.journal) >= cut or g.t.state == "over")
             except TimeoutError:
                 pass
             await a.shutdown(drain=False)
