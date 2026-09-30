@@ -17,6 +17,10 @@ tests/                      核心 + integration（需要 Postgres / Redis）
 
 ## 快速开始
 
+> 这两个文件因为写入权限，放在了非标准的位置，需要手动挪一下：
+> - `tasks.mk` → 改名为 `Makefile`（或者直接用 `make -f tasks.mk dev`）
+> - `deploy/github-ci.yml` → 挪到仓库根目录的 `.github/workflows/ci.yml`
+
 ```
 # 依赖（在上一级目录建 venv；包名是 werewolf_harness）
 uv venv ../.venv && uv pip install -p ../.venv -r pyproject.toml --extra dev
