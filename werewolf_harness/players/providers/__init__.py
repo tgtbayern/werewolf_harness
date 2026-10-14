@@ -78,12 +78,20 @@ def offered(env_keys: dict | None = None) -> list[str]:
     """
     out = [m for m, p in PROFILES.items() if not p.get("retired")]
     if env_keys is not None:
+        # The relay's models need the relay's key, same rule as the Chinese ones below.
+        out = [m for m in out if relay_key(m, env_keys)]
         out += [c.model for c in CANDIDATES
                 if env_keys.get(PROVIDERS[c.provider].env_key) and not c.retired]
         # The local CLI needs no key, only the executable: offered when it can be found.
         if claude_cli.available(env_keys):
             out += list(claude_cli.MENU)
     return out
+
+
+def relay_key(model: str, env_keys: dict) -> str:
+    """The key a relay model is called with ('' when there is none): per vendor group, then the shared one."""
+    group = "CLAUDE" if model.startswith("claude") else "GEMINI" if model.startswith("gemini") else "OPENAI"
+    return env_keys.get(f"LLM_KEY_{group}_GROUP") or env_keys.get("LLM_API_KEY", "")
 
 
 def retired(model: str) -> str | None:

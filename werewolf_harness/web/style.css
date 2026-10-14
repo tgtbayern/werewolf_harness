@@ -305,3 +305,10 @@ button[disabled] { background: var(--line-2); color: var(--ink-2); cursor: defau
 
 /* which round you are reading */
 .chips.roundpick { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+
+/* model picker: one row per way of reaching a model (claude -p / API / local) */
+.mgroups { display: flex; flex-direction: column; gap: 8px; }
+.mgroup { display: flex; flex-direction: column; gap: 4px; }
+.mgroup-label { font-size: 11.5px; color: var(--muted); }
+.chip.cli { border-color: #8a5a2b; }
+.chip.cli.on { background: #8a5a2b; border-color: #8a5a2b; color: var(--paper); }

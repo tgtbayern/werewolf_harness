@@ -69,12 +69,24 @@ const GUARD_WHY = {
 const SHORT = {
   "gemini-3.8-flash": "gemini", "gpt-5.6-terra": "terra", "gpt-5.6-sol": "sol",
   "claude-sonnet-5": "sonnet", "claude-opus-5": "opus", mock: "mock", script: "script",
-  "claude-cli:sonnet": "cc-sonnet", "claude-cli:haiku": "cc-haiku", "claude-cli:opus": "cc-opus", "claude-cli": "cc",
+  "claude-cli:sonnet": "cli-sonnet", "claude-cli:haiku": "cli-haiku", "claude-cli:opus": "cli-opus", "claude-cli": "cli",
   "deepseek-v4-flash": "ds-flash", "deepseek-v4-pro": "ds-pro",
   "kimi-k3": "kimi-k3", "kimi-k2.6": "kimi-k2.6", "glm-5.3": "glm-5.3",
 };
 // 12 次实测（2026-09-03，最大的那个 prompt）。数字在 providers/__init__.py 里，
 // 这里只是同一份测量结果的人话版本。
+const MODEL_GROUPS = [
+  ["cli", "本机 Claude Code · claude -p（不要 key，用 CLI 登录的账号）"],
+  ["relay", "API · 中转站"],
+  ["direct", "API · 厂商直连"],
+  ["local", "本地模拟（不调用模型，测试用）"],
+];
+function modelGroup(m, meta) {
+  if (m === "claude-cli" || m.startsWith("claude-cli:")) return "cli";
+  if (m === "mock" || m === "script" || m.startsWith("sim")) return "local";
+  if (meta.profiles && meta.profiles[m]) return "relay";
+  return "direct";
+}
 const MODEL_WHY = {
   "claude-cli:sonnet": "本机 Claude Code（claude -p），用 CLI 登录的账号，不要 API key。每次调用多 1–2 秒起进程。",
   "claude-cli:haiku": "本机 Claude Code 的 haiku：最快、最省额度。",
@@ -177,18 +189,29 @@ function renderForm() {
   };
   chips("#f-variant", Object.keys(meta.variants).map((v) => [v, `${meta.variants[v].seats} 人`]), "variant",
         () => { f.seat = Math.min(f.seat, meta.variants[f.variant].seats); });
-  // models is a SET: every one you leave on gets dealt to some seat
+  // models is a SET: every one you leave on gets dealt to some seat.
+  // Grouped by how the seat reaches its model, so a claude -p seat and an API seat never look alike.
   const mbox = $("#f-model"); mbox.textContent = "";
-  for (const m of meta.models) {
-    const on = f.models.includes(m);
-    const b = el("button", "chip" + (on ? " on" : ""), SHORT[m] || m);
-    b.title = m;
-    b.onclick = () => {
-      if (on && f.models.length > 1) f.models = f.models.filter((x) => x !== m);
-      else if (!on) f.models = [...f.models, m];
-      renderForm();
-    };
-    mbox.append(b);
+  for (const [gk, glabel] of MODEL_GROUPS) {
+    const ms = meta.models.filter((m) => modelGroup(m, meta) === gk);
+    if (!ms.length) continue;
+    const row = el("div", "mgroup");
+    row.append(el("span", "mgroup-label", glabel));
+    const box = el("div", "chips");
+    for (const m of ms) {
+      const on = f.models.includes(m);
+      const b = el("button", "chip" + (on ? " on" : "") + (gk === "cli" ? " cli" : ""),
+                   gk === "cli" ? (m.split(":")[1] || "默认") : (SHORT[m] || m));
+      b.title = `${m} · ${glabel}`;
+      b.onclick = () => {
+        if (on && f.models.length > 1) f.models = f.models.filter((x) => x !== m);
+        else if (!on) f.models = [...f.models, m];
+        renderForm();
+      };
+      box.append(b);
+    }
+    row.append(box);
+    mbox.append(row);
   }
   chips("#f-guard", meta.guards.map((g) => [g, g]), "guard");
   const n = meta.variants[f.variant].seats;

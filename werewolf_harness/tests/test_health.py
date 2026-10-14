@@ -675,3 +675,10 @@ def test_the_reason_survives_far_enough_to_be_classified():
                    temperature=0.7, max_tokens=10)
     said = _in_plain_words(str(caught.value))
     assert "Kimi" in said and "余额" in said and "platform.kimi.com/console/pay" in said
+
+
+def test_a_relay_model_needs_the_relay_key():
+    from werewolf_harness.players.providers import offered
+    assert "claude-opus-5" not in offered({})
+    assert "claude-opus-5" in offered({"LLM_KEY_CLAUDE_GROUP": "sk-x"})
+    assert "claude-opus-5" in offered({"LLM_API_KEY": "sk-x"})
