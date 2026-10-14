@@ -325,6 +325,10 @@ class Table:
             out["view"] = self.env.observe(seat) if seat and 1 <= seat <= self.n else self.spectator_view()
         if seat in self.human_seats:
             out["me"] = self.me(seat)
+            # the seat's whole own record (the view keeps only the last 14 for the prompt)
+            log = getattr(self.env, "_action_log", None)
+            if log is not None and seat in log:
+                out["my_record"] = list(log[seat])
         out["log"] = [e.to_dict() for e in self.events[-60:]]
         return out
 

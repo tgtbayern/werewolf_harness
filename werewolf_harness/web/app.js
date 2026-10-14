@@ -45,7 +45,7 @@ const state = {
   form: { xray: false, variant: "8p", models: ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3",
             "claude-sonnet-5", "claude-opus-5"], guard: "L1+L2+L3", seat: 3, clock: 300 },
   game: null, seat: null, picked: null, draft: "", tool: null, args: {},
-  es: null, ws: null, conn: "—", sending: false, feedTab: "say", log: null, lastEv: -1, acks: {}, retry: 0,
+  es: null, ws: null, conn: "—", sending: false, feedTab: "flow", log: null, lastEv: -1, acks: {}, retry: 0,
   reviewSeen: false, sayRound: null, voteRound: null,
 };
 
@@ -317,7 +317,7 @@ async function pull() {
   if (s.error) { location.hash = "#/"; return; }
   state.s = s;
   state.pulledAt = Date.now();
-  if (state.picked == null && s.view) state.picked = s.view.you || null;
+  // nothing is opened over the table until you click a seat
   renderTable();
 }
 
@@ -331,7 +331,7 @@ function renderTable() {
     $("#c-sub").textContent = "你已入座，点下面开始";
     $("#c-note").textContent = "";
   }
-  renderNow(); renderFelt(); renderPrivate(); renderPicked(); renderNews(); renderFeed(); renderTurn(); renderHealth();
+  renderPhase(); renderNow(); renderFelt(); renderPrivate(); renderPicked(); renderFeed(); renderTurn(); renderHealth();
 }
 
 
@@ -341,47 +341,71 @@ function renderTable() {
  * facts, and the tool names are the watcher's, not the seat's. */
 function renderNow() {
   const s = state.s, g = s.game, bar = $("#nowbar");
-  bar.textContent = ""; bar.className = "nowbar";
+  bar.textContent = ""; bar.className = "pb-now";
   const a = s.acting || g.acting;
-  if (g.state === "over") {
+  const put = (who, what, extra) => {
+    bar.append(el("span", "dotlive"), el("span", "who", who), el("span", "what", what));
+    if (extra) bar.append(extra);
+  };
+  if (g.state === "over" || g.reviewing) {
     bar.classList.add("idle");
-    bar.append(el("span", "dotlive"), el("span", "who", "牌局结束"),
-      el("span", "what", `${(g.outcome || {}).winner === "village" ? "村民胜" : "狼胜"} · 第 ${g.round} 轮 · ${g.health.turns} 个回合`));
-    return;
+    put("游戏结束", `${(g.outcome || {}).winner === "village" ? "好人阵营" : "狼人阵营"}获胜 · 全场底牌已公开` + (g.reviewing ? "，正在复盘" : ""));
+    if (!g.reviewing || !a) return;
   }
-  if (g.state === "waiting") {
-    bar.classList.add("idle");
-    bar.append(el("span", "dotlive"), el("span", "who", "还没开局"), el("span", "what", "点右下角开始"));
-    return;
-  }
+  if (g.state === "waiting") { bar.classList.add("idle"); put("还没开局", "点右边「开始这一局」"); return; }
   if (g.state === "aborted" || g.state === "crashed") {
     bar.classList.add("idle", "bad");
-    bar.append(el("span", "dotlive"), el("span", "who", g.state === "aborted" ? "这一局作废了" : "这一局崩了"),
-      el("span", "what", g.error || "没有给出原因"));
-    return;
+    put(g.state === "aborted" ? "这一局作废了" : "这一局崩了", g.error || "没有给出原因"); return;
   }
-  if (!a) {
-    bar.classList.add("idle");
-    bar.append(el("span", "dotlive"), el("span", "who", "结算中"), el("span", "what", "裁判在推进这一步"));
-    return;
-  }
+  if (!a) { bar.classList.add("idle"); put("结算中", "裁判在推进下一步"); return; }
+  const secs = el("span", "el", `${Math.round(a.seconds || 0)}s`);
   if (a.actor == null || a.task === "hidden") {
-    // the server keeps night actors private (who moves first would give the seer away)
-    bar.append(el("span", "dotlive"), el("span", "who", "夜里"), el("span", "what", "有人在行动，天亮前不公开是谁"));
-    bar.append(el("span", "el", `${Math.round(a.seconds || 0)}s`));
-    return;
+    put("夜里有人在行动", "身份牌在夜里行动，你看不到是谁、做了什么；天亮只公布结果。", secs); return;
   }
-  const mine = a.actor === state.seat;
-  bar.append(el("span", "dotlive"));
-  bar.append(el("span", "who", mine ? `轮到你（${a.actor} 号）` : `${a.actor} 号`));
-  bar.append(el("span", "what", mine ? `正在${VERB[a.task] || a.task}` : `正在${VERB[a.task] || a.task}` + (a.human ? "（真人）" : `　${SHORT[a.model] || a.model}`)));
+  if (a.actor === state.seat) {
+    bar.classList.add("mine");
+    put(`轮到你了（${a.actor} 号）`, `现在要${VERB[a.task] || a.task} → 在右边操作`, secs); return;
+  }
+  const who = `${a.actor} 号`;
+  const how = a.human ? "真人" : (SHORT[a.model] || a.model || "AI");
+  put(who, `正在${VERB[a.task] || a.task}（${how}）`, secs);
   if (a.steps && a.steps.length) {
-    bar.append(el("span", "tools", "已调用 " + a.steps.filter((x) => x && !x.startsWith("<")).join(" → ")));
+    const used = a.steps.filter((x) => x && !x.startsWith("<")).map(stepCN);
+    if (used.length) bar.append(el("span", "tools", "它这一步已经：" + used.join(" → ")));
   }
-  bar.append(el("span", "el", `${Math.round(a.seconds)}s`));
 }
 
-const VERB = { speak: "发言", vote: "投票", night: "夜里行动", campaign: "竞选警长", campaign_vote: "投警长",
+/* ── where in the game are we ─────────────────────────────────────────── */
+const PHASE_STEP = { night: "night", pack_chat: "night", pack_plan: "night", campaign: "campaign",
+  campaign_vote: "campaign", day_speech: "speech", day_vote: "vote", interrupt: "after", review: "review", over: "review" };
+const isNightPhase = (p) => ["night", "pack_chat", "pack_plan"].includes(String(p));
+
+function renderPhase() {
+  const s = state.s, g = s.game, pub = ((s.view || {}).public) || {};
+  const when = $("#pb-when"), steps = $("#pb-steps");
+  steps.textContent = "";
+  if (g.state === "waiting") { when.textContent = "还没开局"; return; }
+  const over = g.state !== "running" || g.reviewing;
+  const night = isNightPhase(g.phase);
+  when.textContent = over ? (g.reviewing ? "复盘" : "结束") : `第 ${g.round} ${night ? "夜" : "天"}`;
+  const hasCampaign = (pub.sheriff_candidates || []).length || g.phase === "campaign" || g.phase === "campaign_vote"
+    || (pub.speeches || []).some((sp) => sp.kind === "campaign" && sp.round === g.round);
+  const list = [["night", "夜晚：身份牌行动"], ["dawn", "天亮：公布谁死了"]];
+  if (hasCampaign && g.round === 1) list.push(["campaign", "竞选警长"]);
+  list.push(["speech", "轮流发言"], ["vote", "投票放逐"], ["after", "遗言 / 开枪"]);
+  const cur = over ? null : PHASE_STEP[g.phase];
+  let passed = !over;
+  for (const [k, label] of list) {
+    const on = k === cur;
+    const node = el("span", "st" + (on ? " on" : "") + (passed && !on ? " done" : ""), label);
+    steps.append(node);
+    if (on) passed = false;
+  }
+  if (cur == null) [...steps.children].forEach((n) => n.classList.add("done"));
+  else if (!list.some(([k]) => k === cur)) [...steps.children].forEach((n) => n.classList.remove("done"));
+}
+
+const VERB = { review: "复盘发言", speak: "发言", vote: "投票", night: "夜里行动", campaign: "竞选警长", campaign_vote: "投警长",
   last_words: "留遗言", hunter_shoot: "开枪", badge: "移交警徽", pack_chat: "狼频道说话", pack_plan: "定狼队分工" };
 
 function renderFelt() {
@@ -392,7 +416,8 @@ function renderFelt() {
   const alive = new Set(pub.alive || g.alive || []);
   const dead = Object.fromEntries((pub.dead || []).map((d) => [d.player_id, d]));
   const n = g.seats;
-  const live = (s.acting || g.acting) || (s.log || []).slice().reverse().find((e) => e.kind === "phase" && e.actor);
+  const live = (g.state !== "running" || g.reviewing) ? null
+    : (s.acting || g.acting) || (s.log || []).slice().reverse().find((e) => e.kind === "phase" && e.actor);
   for (let i = 0; i < n; i++) {
     const id = i + 1;
     const a = (i * 2 * Math.PI) / n;
@@ -413,6 +438,7 @@ function renderFelt() {
       if (shown === "werewolf") node.classList.add("wolf");
       node.append(el("span", "role", who));
     }
+    node.append(el("span", "today" + (isDead ? " gone" : ""), seatToday(id, isDead, dead[id], live)));
     node.title = (g.seat_models || {})[id] || "";
     node.onclick = () => {
       state.picked = state.picked === id ? null : id;   // click again to put it away
@@ -420,38 +446,95 @@ function renderFelt() {
     };
     felt.append(node);
   }
-  const cur = live && !$("#turn").dataset.mine;
   if (g.state !== "waiting") {
-    $("#c-label").textContent = g.state === "over" ? "结束" : (live ? taskName(live.task) : "进行中");
-    $("#c-seat").textContent = g.state === "over"
-      ? ((g.outcome || {}).winner === "village" ? "村民胜" : "狼胜")
-      : (live ? `${live.actor} 号` : "—");
-    $("#c-sub").textContent = g.state === "over" ? `第 ${g.round} 天结束`
-      : `第 ${g.round} ${String(g.phase).startsWith("night") || String(g.phase).startsWith("pack") ? "夜" : "天"} · ${alive.size} 人在座`;
-    $("#c-note").textContent = live && live.actor === state.seat ? "轮到你" : "";
+    const ended = g.state !== "running" || g.reviewing;
+    const night = isNightPhase(g.phase);
+    const hidden = live && (live.actor == null || live.task === "hidden");
+    $("#c-label").textContent = ended ? "游戏结束" : `第 ${g.round} ${night ? "夜" : "天"}`;
+    $("#c-seat").textContent = ended
+      ? ((g.outcome || {}).winner === "village" ? "好人胜" : "狼人胜")
+      : hidden || (!live && night) ? "夜晚" : live ? (live.actor === state.seat ? "轮到你" : `${live.actor} 号`) : "—";
+    $("#c-sub").textContent = ended ? (g.reviewing ? "正在复盘" : `打了 ${g.round} 天`)
+      : hidden ? "有人在行动，你看不到" : live ? `正在${VERB[live.task] || live.task}` : "裁判结算中";
+    $("#c-note").textContent = `${alive.size} 人存活`;
   }
 }
 
-const TASK_CN = { speak: "发言", vote: "投票", night: "夜晚行动", campaign: "竞选警长", campaign_vote: "投警长",
+/* One short line under a seat: what this player has done today, in public. */
+function seatToday(id, isDead, death, live) {
+  const s = state.s, g = s.game, pub = ((s.view || {}).public) || {};
+  if (isDead) {
+    const how = { exiled: "被放逐", night: "夜里死", shot: "被枪杀", detonated: "自爆" }[death && death.cause] || "出局";
+    return death ? `第${death.round}${death.cause === "night" ? "夜" : "天"}${how}` : "已出局";
+  }
+  if (g.state !== "running" || g.reviewing) return "存活";
+  if (live && live.actor === id) return `▶ 正在${VERB[live.task] || live.task}`;
+  if (isNightPhase(g.phase)) return id === state.seat && (s.me || {}).waiting ? "▶ 轮到你" : "夜里";
+  const r = g.round;
+  const ballot = ((pub.votes || {})[r] || (pub.votes || {})[String(r)] || {});
+  const v = ballot[id] !== undefined ? ballot[id] : ballot[String(id)];
+  if (v !== undefined) return v == null ? "弃票" : `投了 ${v} 号`;
+  const said = (pub.speeches || []).some((sp) => sp.round === r && sp.player_id === id && sp.kind === "speech");
+  if (said) return "已发言";
+  if (g.phase === "day_speech") return "等发言";
+  return "—";
+}
+
+const TASK_CN = { review: "复盘", speak: "发言", vote: "投票", night: "夜晚行动", campaign: "竞选警长", campaign_vote: "投警长",
   last_words: "遗言", hunter_shoot: "猎人开枪", badge: "移交警徽", pack_chat: "狼人频道", pack_plan: "狼队分工" };
 const taskName = (t) => TASK_CN[t] || t;
 
+/* Your side of the table, in three parts: who you are, what only you know, and
+ * everything you have done so far. Built from your own view and your own record;
+ * nobody else's private facts are ever on this page. */
+const OUTCOME_CN = { "werewolf": "是狼人", "not a werewolf": "是好人", "antidote used": "解药已用掉",
+  "poison used": "毒药已用掉", "protected": "守住了", "skipped": "空过", "noted; the pack decides together": "狼队多数决定最终刀谁" };
+const MYKIND_CN = { night_check: "查验", night_kill: "想刀", night_save: "用解药救", night_poison: "用毒药毒",
+  night_protect: "守护", night_skip: "夜里空过", campaign_run: "上警发言", campaign_pass: "不上警", campaign_vote: "投警长",
+  speak: "发言", vote: "投票", last_words: "留遗言", pack_plan: "定狼队分工", review_say: "复盘发言",
+  review_pass: "复盘过", self_detonate: "自爆" };
+
+function myLine(a) {
+  const when = `第${a.round}${a.phase === "night" ? "夜" : "天"}`;
+  let what = MYKIND_CN[a.kind] || a.kind;
+  if (a.abstained) what += " → 弃票";
+  else if (a.target != null) what += ` ${a.target} 号`;
+  if (a.outcome && OUTCOME_CN[a.outcome] !== undefined) what += `：${OUTCOME_CN[a.outcome]}`;
+  else if (a.outcome) what += `：${a.outcome}`;
+  if (a.said) what += `：「${a.said.slice(0, 40)}${a.said.length > 40 ? "…" : ""}」`;
+  return [when, what];
+}
+
 function renderPrivate() {
-  const v = (state.s.view || {}); const p = v.private || {};
+  const s = state.s, v = (s.view || {}); const p = v.private || {};
   const box = $("#private"); box.textContent = "";
-  if (!state.seat) { box.hidden = true; return; }
+  if (!state.seat || !v.role) { box.hidden = true; return; }
   box.hidden = false;
-  box.append(el("h3", null, `你是 ${v.you} 号 · ${roleCN(v.role)}`));
-  const lines = [];
-  if (p.fellow_wolves) lines.push(`狼队友：${p.fellow_wolves.join("、") || "只剩你"}`);
-  if (p.my_tactic) lines.push(`你的分工：${p.my_tactic}`);
-  if (p.checks) lines.push(...(p.checks.length
-    ? p.checks.map((c) => `第 ${c.round} 夜验 ${c.target} 号 · ${c.is_wolf ? "狼" : "好人"}`)
-    : ["还没验过人"]));
-  if ("antidote_available" in p) lines.push(`解药 ${p.antidote_available ? "还在" : "已用"} · 毒药 ${p.poison_available ? "还在" : "已用"}`);
-  if (v.night && v.night.victims_tonight) lines.push(`今晚被刀：${v.night.victims_tonight.join("、") || "还没定"}`);
-  if (!lines.length) lines.push("你没有夜间能力，靠发言和投票。");
-  for (const l of lines) box.append(el("div", null, l));
+  const team = v.team === "werewolf" || v.role === "werewolf" ? "狼人阵营" : "好人阵营";
+  box.append(el("div", "me-id", `你是 ${v.you} 号 · ${roleCN(v.role)}`), el("div", "me-team", team));
+
+  box.append(el("h3", null, "只有你知道的"));
+  const know = [];
+  if (p.fellow_wolves) know.push(`狼队友：${p.fellow_wolves.length ? p.fellow_wolves.map((x) => x + " 号").join("、") : "只剩你一个"}`);
+  if (p.my_tactic) know.push(`你的分工：${p.my_tactic}`);
+  if (p.pack_vote_target) know.push(`狼队约定今天投 ${p.pack_vote_target} 号`);
+  if (p.checks) know.push(...(p.checks.length
+    ? p.checks.map((c) => `第 ${c.round} 夜验了 ${c.target} 号 → ${c.is_wolf ? "狼人" : "好人"}`)
+    : ["你还没验过人"]));
+  if ("antidote_available" in p) know.push(`解药${p.antidote_available ? "还在" : "已用掉"} · 毒药${p.poison_available ? "还在" : "已用掉"}`);
+  if (v.night && v.night.victims_tonight) know.push(`今晚被刀的是：${v.night.victims_tonight.join("、") || "还没定"}`);
+  if (!know.length) know.push("你是普通村民，夜里没有能力，也没有私人信息。你和其他人知道的一样多：只有公开的发言和票型。");
+  const ul = el("ul", "know"); for (const k of know) ul.append(el("li", null, k)); box.append(ul);
+
+  box.append(el("h3", null, "你做过的事"));
+  const rec = s.my_record || p.my_actions || [];
+  if (!rec.length) box.append(el("div", "it", "还没有。"));
+  else {
+    const ol = el("div", "mine-log");
+    for (const a of rec) { const [w, t] = myLine(a); const row = el("div", "ml"); row.append(el("span", "w", w), el("span", "t", t)); ol.append(row); }
+    box.append(ol);
+  }
+  box.append(el("div", "dont", "你不知道别人的身份。死人不翻牌，结束时全场翻牌。"));
 }
 
 const ROLE_CN = { werewolf: "狼人", seer: "预言家", witch: "女巫", hunter: "猎人", guard: "守卫", villager: "村民" };
@@ -542,14 +625,16 @@ function renderFeed() {
   // The review is the point of the table once it starts; land on it once, then leave
   // the reader wherever they go next.
   if (reviewing && !state.reviewSeen) { state.feedTab = "review"; state.reviewSeen = true; }
-  for (const [id, key] of [["#tab-say", "say"], ["#tab-vote", "vote"],
+  for (const [id, key] of [["#tab-flow", "flow"], ["#tab-say", "say"], ["#tab-vote", "vote"],
                            ["#tab-all", "all"], ["#tab-review", "review"]]) {
     $(id).className = "t" + (state.feedTab === key ? " on" : "");
   }
+  $("#tab-flow").onclick = () => { state.feedTab = "flow"; renderFeed(); };
   $("#tab-say").onclick = () => { state.feedTab = "say"; renderFeed(); };
   $("#tab-vote").onclick = () => { state.feedTab = "vote"; renderFeed(); };
   $("#tab-all").onclick = () => { state.feedTab = "all"; loadLog(); };
   $("#tab-review").onclick = () => { state.feedTab = "review"; renderFeed(); };
+  if (state.feedTab === "flow") return renderFlow();
   if (state.feedTab === "all") return renderLog();
   if (state.feedTab === "vote") return renderVotes();
   if (state.feedTab === "review") return renderReview();
@@ -583,6 +668,98 @@ function renderFeed() {
   // should start at its first speech, not its last.
   const scroller = box.closest(".feed");
   if (scroller) scroller.scrollTop = state.sayRound == null ? scroller.scrollHeight : 0;
+}
+
+/* ────────────────────────── 进程
+ * The whole game so far as one story, in order: each night, then each day --
+ * who died, who said what, who voted for whom, what came of it -- plus what YOU
+ * did at night, which only you see. Built from your own view, so it never shows
+ * anything your seat is not entitled to. The step being played now is the last
+ * line, marked ▶. */
+function renderFlow() {
+  const s = state.s, g = s.game, v = s.view || {}, pub = v.public || {}, p = v.private || {};
+  const box = $("#speeches"); box.textContent = "";
+  $("#spoken").textContent = g.state === "waiting" ? "" : `第 ${g.round} ${isNightPhase(g.phase) ? "夜" : "天"}`;
+  if (g.state === "waiting") { box.append(el("div", "it", "还没开局。")); return; }
+  const mine = s.my_record || p.my_actions || [];
+  const speeches = pub.speeches || [];
+  const dead = pub.dead || [];
+  const ended = g.state !== "running" || g.reviewing;
+  const add = (cls, who, text) => {
+    const row = el("div", "fl " + cls);
+    if (who) row.append(el("span", "fw", who));
+    row.append(el("span", "ft", text));
+    box.append(row);
+    return row;
+  };
+  const me = (id) => (id === state.seat ? `你（${id} 号）` : `${id} 号`);
+  const live = () => {
+    if (ended) return;
+    const a = s.acting || g.acting;
+    if (!a) { add("live", "▶", "裁判正在结算这一步……"); return; }
+    if (a.actor == null || a.task === "hidden") { add("live", "▶", "夜里有人在行动（你看不到是谁、做了什么）"); return; }
+    if (a.actor === state.seat) { add("live mine", "▶", `轮到你${VERB[a.task] || a.task}了，在上面操作`); return; }
+    add("live", "▶", `${a.actor} 号正在${VERB[a.task] || a.task}……（${a.human ? "真人" : SHORT[a.model] || a.model || "AI"}）`);
+  };
+  const lastRound = g.round;
+  for (let r = 1; r <= lastRound; r++) {
+    // ── night r
+    box.append(el("div", "fh night", `第 ${r} 夜`));
+    for (const c of (p.pack_chat || []).filter((e) => e.round === r)) {
+      add("private", `狼频道 · ${me(c.player_id)}`, c.content || "（沉默）");
+    }
+    const myNight = mine.filter((a) => a.round === r && a.phase === "night");
+    for (const a of myNight) add("private mine", "你", myLine(a)[1]);
+    if (!myNight.length) add("muted", "", v.role === "villager" ? "你是村民，夜里闭眼。狼人和神职在行动，你看不到。"
+      : "狼人和神职依次行动。别人做了什么你看不到。");
+    const nightNow = r === lastRound && isNightPhase(g.phase);
+    if (nightNow) { live(); break; }
+
+    // ── day r
+    box.append(el("div", "fh day", `第 ${r} 天`));
+    const nd = dead.filter((d) => d.round === r && d.cause === "night");
+    add("dawn", "天亮", nd.length ? `${nd.map((d) => me(d.player_id)).join("、")} 昨晚死了（不公布怎么死的）` : "平安夜，昨晚没有人死");
+    for (const sp of speeches.filter((x) => x.round === r && x.kind === "campaign")) add("say", `${me(sp.player_id)} 上警`, sp.content);
+    if (r === 1 && pub.sheriff) add("event", "", `${me(pub.sheriff)} 当选警长：每天第一个发言，投票算 1.5 票`);
+    const exiled = (pub.exiles || {})[r] !== undefined ? pub.exiles[r] : (pub.exiles || {})[String(r)];
+    const nightVictims = new Set(nd.map((d) => d.player_id));
+    for (const sp of speeches.filter((x) => x.round === r && x.kind === "last_words" && nightVictims.has(x.player_id))) {
+      add("say last", `${me(sp.player_id)} 的遗言`, sp.content);
+    }
+    for (const sp of speeches.filter((x) => x.round === r && x.kind === "speech")) {
+      add("say" + (sp.player_id === state.seat ? " mine" : ""), me(sp.player_id), sp.content);
+    }
+    const ballot = (pub.votes || {})[r] || (pub.votes || {})[String(r)];
+    if (ballot && Object.keys(ballot).length) {
+      const vb = el("div", "fl vote");
+      vb.append(el("span", "fw", "投票"));
+      const body = el("span", "ft");
+      const byTarget = {};
+      for (const [voter, t] of Object.entries(ballot)) (byTarget[t == null ? "弃票" : t] = byTarget[t == null ? "弃票" : t] || []).push(Number(voter));
+      for (const [t, vs] of Object.entries(byTarget).sort((a, b) => b[1].length - a[1].length)) {
+        const line = el("div", "vline" + (String(exiled) === String(t) ? " out" : ""));
+        line.append(el("b", null, t === "弃票" ? "弃票" : `${t} 号 ${vs.length} 票`), document.createTextNode(` ← ${vs.map((x) => x === state.seat ? "你" : x + "号").join("、")}`));
+        body.append(line);
+      }
+      vb.append(body); box.append(vb);
+      const has = Object.prototype.hasOwnProperty.call(pub.exiles || {}, r) || Object.prototype.hasOwnProperty.call(pub.exiles || {}, String(r));
+      if (has) add("event out", "结果", exiled == null ? "平票，没有人出局" : `${me(exiled)} 被投票放逐`);
+    }
+    for (const sp of speeches.filter((x) => x.round === r && x.kind === "last_words" && !nightVictims.has(x.player_id))) {
+      add("say last", `${me(sp.player_id)} 的遗言`, sp.content);
+    }
+    for (const sh of (pub.shots || []).filter((x) => x.round === r)) add("event out", "开枪", `${me(sh.by)} 是猎人，开枪带走了 ${me(sh.target)}`);
+    for (const d of (pub.detonations || []).filter((x) => x.round === r)) add("event out", "自爆", `${me(d.player_id)} 自爆，亮明狼人身份，今天直接结束`);
+    for (const b of (pub.badge_transfers || []).filter((x) => x.round === r)) {
+      add("event", "警徽", b.to ? `${me(b.from)} 把警徽交给了 ${me(b.to)}` : `${me(b.from)} 撕掉了警徽`);
+    }
+    if (r === lastRound) live();
+  }
+  if (ended) {
+    const w = (g.outcome || {}).winner;
+    add("end", "结束", w ? `${w === "village" ? "好人阵营" : "狼人阵营"}获胜。全场底牌在「复盘」里。` : "这一局结束了。");
+  }
+  const scroller = box.closest(".feed"); if (scroller) scroller.scrollTop = scroller.scrollHeight;
 }
 
 /* One row of round chips, plus 全部. Writes the chosen round into `state[key]`
