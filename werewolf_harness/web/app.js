@@ -365,6 +365,12 @@ function renderNow() {
     bar.append(el("span", "dotlive"), el("span", "who", "结算中"), el("span", "what", "裁判在推进这一步"));
     return;
   }
+  if (a.actor == null || a.task === "hidden") {
+    // the server keeps night actors private (who moves first would give the seer away)
+    bar.append(el("span", "dotlive"), el("span", "who", "夜里"), el("span", "what", "有人在行动，天亮前不公开是谁"));
+    bar.append(el("span", "el", `${Math.round(a.seconds || 0)}s`));
+    return;
+  }
   const mine = a.actor === state.seat;
   bar.append(el("span", "dotlive"));
   bar.append(el("span", "who", mine ? `轮到你（${a.actor} 号）` : `${a.actor} 号`));
