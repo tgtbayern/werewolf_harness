@@ -71,6 +71,15 @@ def test_creating_needs_a_login(client_factory):
     assert c.post("/api/games", json={"variant": "8p"}).status_code == 401
 
 
+def test_a_model_nobody_can_serve_is_refused_at_creation(client_factory):
+    # a seat with no key would be played by the rule fallback for the whole game
+    c = client_factory()
+    h, _ = _guest(c)
+    r = c.post("/api/games", json={"variant": "8p", "models": ["deepseek-v4-pro", "mock"], "human_seats": [3]}, headers=h)
+    assert r.status_code == 400 and "deepseek-v4-pro" in r.text
+    assert "mock" in c.get("/api/meta").json()["models"]
+
+
 def test_a_seat_is_private_to_whoever_claimed_it(client_factory):
     c = client_factory()
     h, _ = _guest(c)

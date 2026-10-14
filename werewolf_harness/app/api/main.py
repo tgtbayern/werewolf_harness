@@ -77,6 +77,14 @@ def build_runtime(settings: Settings, store: Store, redis: Redis, env_keys: dict
     return rt
 
 
+LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky"]
+
+
+def _playable(env_keys: dict) -> list[str]:
+    """Every model a seat can actually be filled with right now."""
+    return offered(env_keys) + LOCAL_MODELS
+
+
 def create_app(settings: Settings | None = None, *, migrate_on_start: bool = True, executor=None,
                env_keys: dict | None = None) -> FastAPI:
     settings = settings or get_settings()
@@ -225,8 +233,7 @@ def _routes(app: FastAPI) -> None:
     async def meta(request: Request):
         return {"variants": {k: {"seats": v.num_players, "sheriff": v.sheriff, "roles": v.role_counts}
                              for k, v in VARIANTS.items()},
-                "models": offered(request.app.state.env_keys) + ["mock", "script", "sim", "sim-strong", "sim-cheap",
-                                                                  "sim-flaky"],
+                "models": _playable(request.app.state.env_keys),
                 "profiles": PROFILES, "guards": ["无", "L1", "L1+L2", "L1+L2+L3"]}
 
     @app.get("/api/games")
@@ -264,7 +271,14 @@ def _routes(app: FastAPI) -> None:
         if variant not in VARIANTS:
             raise HTTPException(400, "unknown variant")
         models = body.get("models") or body.get("model", "mock")
-        cfg = TableConfig(variant=variant, models=[models] if isinstance(models, str) else list(models),
+        models = [models] if isinstance(models, str) else list(models)
+        # A seat whose model has no key (or whose CLI is missing) would be played by the
+        # rule fallback for the whole game -- refuse it here instead of 40 turns later.
+        playable = set(_playable(request.app.state.env_keys))
+        unusable = [m for m in dict.fromkeys(models + list(body.get("fallbacks") or [])) if m not in playable]
+        if unusable:
+            raise HTTPException(400, f"这些模型现在用不了（没有 key，或本机找不到 claude）：{', '.join(unusable)}")
+        cfg = TableConfig(variant=variant, models=models,
                           guard=body.get("guard", "L1+L2+L3"), playbook=body.get("playbook", "static"),
                           human_seats=[int(x) for x in body.get("human_seats", [])],
                           turn_seconds=None if body.get("turn_seconds") in (None, 0, "0") else float(body["turn_seconds"]),

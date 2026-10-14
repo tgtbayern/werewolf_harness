@@ -95,7 +95,18 @@ async function openLobby() {
   $("#lobby").hidden = false; $("#table").hidden = true;
   $("#nav-lobby").classList.add("on"); $("#nav-table").hidden = true;
   closeLive();
-  if (!state.meta) state.meta = await api("/api/meta");
+  if (!state.meta) {
+    state.meta = await api("/api/meta");
+    // Keep only models this server can fill right now; if none of the defaults are,
+    // start from the local Claude Code CLI when it is there.
+    const ok = new Set(state.meta.models), f = state.form;
+    f.models = f.models.filter((m) => ok.has(m));
+    if (!f.models.length) {
+      const pick = ["claude-cli:haiku", "claude-cli:sonnet"].find((m) => ok.has(m))
+        || state.meta.models.find((m) => !["mock", "script"].includes(m) && !m.startsWith("sim")) || "mock";
+      f.models = [pick];
+    }
+  }
   renderForm();
   await refreshGames();
   clearInterval(window._poll);
