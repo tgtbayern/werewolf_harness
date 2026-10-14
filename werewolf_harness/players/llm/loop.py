@@ -27,6 +27,9 @@ from .tools import InfoRegistry, SemanticError, ToolContext, build_registry
 
 _RECORD_TOOLS = {"query_history", "query_votes", "query_deaths"}
 NOTE_MAX_CHARS = 400
+# Repeated at the end of the turn's message: models follow the last instruction they read,
+# and the English examples in the tool protocol otherwise pull `thought` back into English.
+LANG_REMINDER = {"zh": "\n\n（用简体中文：发言内容和每一步的 thought 都写中文。）", "en": ""}
 NOTE_PROMPT = ("[harness] Before this turn ends, write a note to yourself for your next turn: what you decided and why, "
                f"what to watch for. At most {NOTE_MAX_CHARS} characters. Plain text only.")
 _WANTED = {"speak": "speak", "vote": "vote", "pack_plan": "pack_plan", "campaign": "campaign_run or campaign_pass",
@@ -87,8 +90,9 @@ class LLMPlayer:
                  temperature: float = 0.7, max_tokens: int = 700, playbook: bool = True, forensics_gate: bool = False,
                  transport_budget: TransportBudget | None = None, anonymise_speakers: bool = False,
                  registry: InfoRegistry | None = None, token_budget: TokenBudget | None = None,
-                 on_step=None):
+                 on_step=None, lang: str = "zh"):
         self.client = client
+        self.lang = lang
         self.guard = guard or GuardStack()
         self.policy = policy or RecoveryPolicy()
         self.temperature = temperature
@@ -99,7 +103,8 @@ class LLMPlayer:
         self.token_budget = token_budget
         self.on_step = on_step or (lambda seat, step: None)   # a watcher, never a decider
         self.last_forced = False        # the driver reads this: a fallback is not a decision
-        self.context = ContextBuilder(self.guard, max_steps=self.policy.max_react_steps, anonymise_speakers=anonymise_speakers)
+        self.context = ContextBuilder(self.guard, max_steps=self.policy.max_react_steps, anonymise_speakers=anonymise_speakers,
+                                      lang=lang)
         self.registry = registry
         self.belief: BeliefState | None = None
         # A note to the next turn: one bounded string the model writes as the turn
@@ -145,7 +150,7 @@ class LLMPlayer:
         result.guard_detections.extend(detections)
         messages = [
             {"role": "system", "content": self.context.system_message(view, terminal_names, [t.name for t in info_tools])},
-            {"role": "user", "content": situation},
+            {"role": "user", "content": situation + LANG_REMINDER.get(self.lang, "")},
         ]
         if feedback:
             messages.append({"role": "user", "content": f"[guard] Your previous answer was refused: {feedback}. Reply with exactly one legal terminal action."})

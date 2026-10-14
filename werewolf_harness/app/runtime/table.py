@@ -55,6 +55,7 @@ class TableConfig:
     # route by task instead of by seat: {"strong": m1, "cheap": m2, "strong_tasks": [...]}
     routing: dict | None = None
     lane: str | None = None           # queue lane override (e.g. "offline" for batch experiments)
+    lang: str = "zh"                  # what the AI seats speak: "zh" (简体中文) or "en"
     # Experiments abandon a game whose models keep failing (a sample the harness played
     # is not a sample). A table with people at it keeps going on rule seats instead.
     abort_on_outage: bool = False
@@ -164,7 +165,7 @@ class Table:
         budget = self.transport if (self.cfg.abort_on_outage or self.hub is None) else None
         return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
                          token_budget=self.tokens, playbook=self.cfg.playbook != "none",
-                         on_step=on_step)
+                         on_step=on_step, lang=self.cfg.lang)
 
     def client_for(self, model: str, seat: int):
         if model == "mock":

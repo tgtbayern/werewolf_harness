@@ -284,7 +284,7 @@ def _routes(app: FastAPI) -> None:
                           turn_seconds=None if body.get("turn_seconds") in (None, 0, "0") else float(body["turn_seconds"]),
                           max_tokens=int(body.get("max_tokens") or DEFAULT_MAX_TOKENS), xray=bool(body.get("xray")),
                           fallbacks=list(body.get("fallbacks") or []), routing=body.get("routing") or None,
-                          lane=body.get("lane"))
+                          lane=body.get("lane"), lang=body.get("lang") if body.get("lang") in ("zh", "en") else "zh")
         try:
             a = await s.rt.create(cfg, seed=int(body.get("seed") or 0) or None, created_by=user["id"])
         except ValueError as e:

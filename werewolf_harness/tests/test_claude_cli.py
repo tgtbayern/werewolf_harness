@@ -162,3 +162,15 @@ def test_offered_only_when_the_executable_is_found(fake, tmp_path):
 def test_the_service_builds_a_cli_seat(fake):
     c = _client("claude-cli:opus", 1, fake["env"])
     assert isinstance(c, ClaudeCLIClient) and c.cli_model == "opus" and c.tool_mode == "json_prompt"
+
+
+def test_ai_seats_speak_chinese_unless_told_otherwise():
+    from werewolf_harness.envs import Werewolf
+    from werewolf_harness.players.guard import GuardStack
+    from werewolf_harness.players.llm.context import ContextBuilder
+    env = Werewolf("8p")
+    env.reset(1)
+    view = env.observe(1)
+    zh = ContextBuilder(GuardStack()).system_message(view, ["speak"], [])
+    en = ContextBuilder(GuardStack(), lang="en").system_message(view, ["speak"], [])
+    assert "简体中文" in zh and "简体中文" not in en

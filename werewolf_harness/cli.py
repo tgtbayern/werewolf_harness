@@ -40,7 +40,7 @@ def cmd_play(a: argparse.Namespace) -> int:
     tokens = TokenBudget(max_tokens=a.max_tokens, max_usd=a.max_usd)
     players = {s: LLMPlayer(_client(a.model, a.seed * 100 + s), guard=guard, transport_budget=budget,
                             token_budget=tokens, playbook=a.playbook != "none",
-                            temperature=a.temperature) for s in range(1, n + 1)}
+                            temperature=a.temperature, lang=a.lang) for s in range(1, n + 1)}
     t0 = time.time()
     crashed = None
     try:
@@ -209,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="本地估算的每局 token 上限，超了停局")
     pl.add_argument("--max-usd", type=float, default=None, dest="max_usd")
     pl.add_argument("--out", default=None)
+    pl.add_argument("--lang", default="zh", choices=["zh", "en"], help="AI 发言用的语言")
     rp = sub.add_parser("replay")
     rp.add_argument("file")
     rp.add_argument("--upto", type=int, default=None)

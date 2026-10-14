@@ -33,6 +33,15 @@ turn with a terminal action. The tools this turn offers are listed under THIS TU
 Speeches from earlier rounds are NOT shown to you. Use query_history to recall
 them."""
 
+# What the agents speak at the table. The prompts themselves stay in English (they are
+# pinned by tests and shared across seats for the prompt cache); only the output language moves.
+LANG_LINES = {
+    "zh": "Write everything you say at the table -- speeches, last words, pack chat, and every `thought` -- "
+          "in Simplified Chinese (简体中文), the way a Chinese player talks. Tool names, argument names and "
+          "the JSON envelope stay exactly as specified, in English.",
+    "en": "",
+}
+
 _ACTION_CN = {"night_check": "验人", "night_kill": "刀人", "night_save": "用解药救", "night_poison": "用毒药毒",
               "night_protect": "守护", "night_skip": "夜里空过", "speak": "发言", "vote": "投票",
               "last_words": "留遗言", "campaign_run": "竞选警长", "campaign_pass": "退出竞选",
@@ -51,8 +60,9 @@ _SPEECH_LABEL = {"campaign": ", running for sheriff",
 class ContextBuilder:
     def __init__(self, guard: GuardStack, max_steps: int = 8, max_observation_chars: int = MAX_OBSERVATION_CHARS,
                  max_steps_in_context: int = MAX_STEPS_IN_CONTEXT, anonymise_speakers: bool = False,
-                 cache_layout: bool = True):
+                 cache_layout: bool = True, lang: str = "zh"):
         self.guard = guard
+        self.lang_line = LANG_LINES.get(lang, "")
         self.max_steps = max_steps
         self.max_observation_chars = max_observation_chars
         self.max_steps_in_context = max_steps_in_context
@@ -72,6 +82,8 @@ class ContextBuilder:
                 parts += [preamble, ""]
             parts.append(OUTPUT_CONTRACT.format(max_steps=self.max_steps, tool_lines=_tool_lines(info_names, terminal_names)))
             parts += ["", f"You are player {view['you']}. Speak in the first person, in at most 4 sentences, like a player at the table."]
+            if self.lang_line:
+                parts += [self.lang_line]
             return "\n".join(parts)
         # shared by every seat and every turn of this table
         parts = [view["rules"], ""]
@@ -79,6 +91,8 @@ class ContextBuilder:
             parts += [preamble, ""]
         parts += [OUTPUT_CONTRACT_STATIC.format(max_steps=self.max_steps), "",
                   "Speak in the first person, in at most 4 sentences, like a player at the table.", ""]
+        if self.lang_line:
+            parts += [self.lang_line, ""]
         # this seat, this turn
         parts += [self._identity(view), "", "THIS TURN:", _tool_lines(info_names, terminal_names), "",
                   f"You are player {view['you']}."]
