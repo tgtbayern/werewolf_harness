@@ -326,9 +326,9 @@ function renderTable() {
   $("#lede").textContent = `${g.id} · ${g.variant} · ${g.model}`
     + (g.xray ? " · 测试模式" : "") + (g.state === "over" ? " · 已结束" : "");
   if (g.state === "waiting") {
-    $("#c-label").textContent = "还没开局";
-    $("#c-seat").textContent = `${g.id}`;
-    $("#c-sub").textContent = "你已入座，点下面开始";
+    $("#c-label").textContent = `桌号 ${g.id}`;
+    $("#c-seat").textContent = "还没开局";
+    $("#c-sub").textContent = "点「开始这一局」按钮";
     $("#c-note").textContent = "";
   }
   renderPhase(); renderNow(); renderFelt(); renderPrivate(); renderPicked(); renderFeed(); renderTurn(); renderHealth();
@@ -352,7 +352,7 @@ function renderNow() {
     put("游戏结束", `${(g.outcome || {}).winner === "village" ? "好人阵营" : "狼人阵营"}获胜 · 全场底牌已公开` + (g.reviewing ? "，正在复盘" : ""));
     if (!g.reviewing || !a) return;
   }
-  if (g.state === "waiting") { bar.classList.add("idle"); put("还没开局", "点右边「开始这一局」"); return; }
+  if (g.state === "waiting") { bar.classList.add("idle"); put("还没开局", "点「开始这一局」按钮"); return; }
   if (g.state === "aborted" || g.state === "crashed") {
     bar.classList.add("idle", "bad");
     put(g.state === "aborted" ? "这一局作废了" : "这一局崩了", g.error || "没有给出原因"); return;
@@ -364,7 +364,7 @@ function renderNow() {
   }
   if (a.actor === state.seat) {
     bar.classList.add("mine");
-    put(`轮到你了（${a.actor} 号）`, `现在要${VERB[a.task] || a.task} → 在右边操作`, secs); return;
+    put(`轮到你了（${a.actor} 号）`, `现在要${VERB[a.task] || a.task} → 在「轮到你」面板里操作`, secs); return;
   }
   const who = `${a.actor} 号`;
   const how = a.human ? "真人" : (SHORT[a.model] || a.model || "AI");
@@ -421,9 +421,10 @@ function renderFelt() {
   for (let i = 0; i < n; i++) {
     const id = i + 1;
     const a = (i * 2 * Math.PI) / n;
-    const node = el("div", "seat");
-    node.style.left = `${50 + 43.5 * Math.sin(a) - 6.5}%`;
-    node.style.top = `${50 - 43.5 * Math.cos(a) - 6.5}%`;
+    const node = el("div", "seat" + (n > 9 ? " many" : ""));
+    // the seat is centred on its point on the ring, whatever size it ends up
+    node.style.left = `${50 + 41 * Math.sin(a)}%`;
+    node.style.top = `${50 - 41 * Math.cos(a)}%`;
     const isDead = !alive.has(id) && (pub.alive || g.alive || []).length > 0;
     if (isDead) node.classList.add("dead");
     if (id === state.seat) node.classList.add("you");
@@ -463,6 +464,7 @@ function renderFelt() {
 /* One short line under a seat: what this player has done today, in public. */
 function seatToday(id, isDead, death, live) {
   const s = state.s, g = s.game, pub = ((s.view || {}).public) || {};
+  if (g.state === "waiting") return "";
   if (isDead) {
     const how = { exiled: "被放逐", night: "夜里死", shot: "被枪杀", detonated: "自爆" }[death && death.cause] || "出局";
     return death ? `第${death.round}${death.cause === "night" ? "夜" : "天"}${how}` : "已出局";
@@ -698,7 +700,7 @@ function renderFlow() {
     const a = s.acting || g.acting;
     if (!a) { add("live", "▶", "裁判正在结算这一步……"); return; }
     if (a.actor == null || a.task === "hidden") { add("live", "▶", "夜里有人在行动（你看不到是谁、做了什么）"); return; }
-    if (a.actor === state.seat) { add("live mine", "▶", `轮到你${VERB[a.task] || a.task}了，在上面操作`); return; }
+    if (a.actor === state.seat) { add("live mine", "▶", `轮到你${VERB[a.task] || a.task}了，在「轮到你」面板里操作`); return; }
     add("live", "▶", `${a.actor} 号正在${VERB[a.task] || a.task}……（${a.human ? "真人" : SHORT[a.model] || a.model || "AI"}）`);
   };
   const lastRound = g.round;

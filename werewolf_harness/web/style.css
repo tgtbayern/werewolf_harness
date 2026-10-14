@@ -389,3 +389,25 @@ main.table { grid-template-rows: auto minmax(0, 1fr); }
 .felt-box { flex: 0 0 auto; }
 .felt { height: auto; width: min(100%, 540px, 62vh); min-width: 360px; aspect-ratio: 1; }
 @media (max-width: 1120px) { .felt { width: min(100%, 520px); } }
+
+/* seats: a fixed, readable size centred on their point of the ring, never squeezed
+ * into an oval by large text or a small table */
+.felt { width: min(100%, 600px, 70vh); min-width: 460px; }
+.seat { width: 76px; height: 76px; aspect-ratio: auto; transform: translate(-50%, -50%); padding: 0 4px; }
+.seat.many { width: 64px; height: 64px; }
+.seat:hover { transform: translate(-50%, -50%) scale(1.07); }
+.seat .t, .seat .role { white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-size: 10.5px; }
+.seat .n { font-size: 18px; }
+.centre { inset: 25%; }
+.c-seat { font-size: clamp(20px, 3.4vh, 34px); white-space: nowrap; }
+.c-label { white-space: nowrap; }
+/* one column on narrow windows: the page scrolls as a whole and nothing is squeezed */
+@media (max-width: 1120px) {
+  main.table { grid-template-rows: auto auto auto; overflow-y: auto; }
+  .felt-wrap { overflow: visible; }
+  .felt { min-width: 0; width: min(100%, 520px); }
+}
+@media (max-width: 1120px) {
+  main.table { display: flex; flex-direction: column; gap: 16px; }
+  main.table > * { flex-shrink: 0; min-height: auto; }
+}
