@@ -56,6 +56,8 @@ class TableConfig:
     routing: dict | None = None
     lane: str | None = None           # queue lane override (e.g. "offline" for batch experiments)
     lang: str = "zh"                  # what the AI seats speak: "zh" (简体中文) or "en"
+    # ask every open model turn at once (votes, the review, independent night roles)
+    parallel: bool = True
     # Experiments abandon a game whose models keep failing (a sample the harness played
     # is not a sample). A table with people at it keeps going on rule seats instead.
     abort_on_outage: bool = False
@@ -111,6 +113,8 @@ class Table:
         self.seat_stats: dict[int, dict] = {s: {"turns": 0, "forced": 0} for s in range(1, self.n + 1)}
         self.stale_results = 0
         self.recoveries = 0
+        self.asked_ahead = 0                  # model turns asked before they were due
+        self.misses = 0                       # ... whose answer could not be used and was asked again
 
         # Which model sits where: round-robin over a seeded shuffle (as before), so a
         # mixed table does not always hand seat 1 the same model.
@@ -285,6 +289,7 @@ class Table:
                 "forced_rate": round(forced / turns, 4) if turns else 0.0,
                 "usable": (forced / turns if turns else 0) <= 0.05,
                 "replays": self.ledger.replays, "stale_results": self.stale_results,
+                "asked_ahead": self.asked_ahead, "misses": self.misses,
                 "recoveries": self.recoveries, "transport_failures": self.transport.failures,
                 "tokens": self.tokens.total_tokens, "max_tokens": self.tokens.max_tokens,
                 "gateway_drift": self.tokens.drift()}

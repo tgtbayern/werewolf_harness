@@ -203,15 +203,21 @@ class Worker:
             self.stale += 1
             return None
         rows = await self.store.journal(gid)
-        if len(rows) != version:
-            self.stale += 1                               # the world moved on; the actor no longer wants this
+        if len(rows) < version:
+            self.stale += 1                               # written by an owner whose steps were never committed
             return None
+        # A job may have been asked ahead of its turn (an open vote), so the world may have
+        # moved since `version`. It is still wanted if the seat's turn is still open now; the
+        # actor checks at commit time that the seat sees what it saw when it was asked.
         table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys, hub=self.hub)
         from ..runtime.runtime import Runtime
         Runtime.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows])
         t = table.turn
-        if not isinstance(t, Turn) or t.actor != seat or t.task != f["task"]:
-            self.stale += 1
+        opener = getattr(table.env, "open_turns", None)
+        opened = ([t] if isinstance(t, Turn) else []) + (list(opener()) if callable(opener) and isinstance(t, Turn) else [])
+        t = next((o for o in opened if o.actor == seat and o.task == f["task"]), None)
+        if t is None:
+            self.stale += 1                               # the world moved on; the actor no longer wants this
             return None
         mem = json.loads(f["memory"]) if f.get("memory") else None
         job = AgentJob(gid, seat, version, t.task, table.env.observe(seat), table.env.action_space(seat, t.task),

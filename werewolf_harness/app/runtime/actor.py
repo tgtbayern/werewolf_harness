@@ -29,6 +29,7 @@ from typing import Any
 from sqlalchemy.exc import DBAPIError
 
 from ...arena import Terminal, Turn
+from ...arena.driver import fingerprint, spec_key
 from ...players.human import Pending
 from ...server.service import _in_plain_words
 from ..obs import logging as olog
@@ -100,6 +101,13 @@ class GameActor:
         self.stats = ActorStats()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._turn_span = None
+        # Model seats asked and not yet committed, one per seat. Besides the seat whose
+        # turn it is, every seat whose turn the engine declares open (a sealed vote, a
+        # review round, the seer and the guard at night) is asked at once; answers are
+        # committed one by one in journal order, each only if the seat still sees what it
+        # saw when it was asked. A model job is stateless (memory travels with it), so an
+        # answer that went stale is simply not used -- there is nothing to undo.
+        self.asks: dict[int, dict] = {}
 
     @property
     def id(self) -> str:
@@ -220,15 +228,63 @@ class GameActor:
             if secs is not None:
                 self._arm(secs, TimerFired(v, "human"))
         else:
-            job = AgentJob(self.id, turn.actor, v, turn.task, view, spec, self.t.memory.get(turn.actor),
-                           make_player=lambda on_step, s=turn.actor, task=turn.task, v=v:
-                           self.t.make_player(s, on_step=on_step, task=task, version=v),
-                           on_step=self._step_from_thread,
-                           lane=self.t.cfg.lane or ("human" if self.t.human_seats else "online"),
-                           trace_ctx=turn_ctx)
             self._arm(self.agent_timeout_s, TimerFired(v, "agent"))
-            self.executor.submit(job, self.post)
+        opened = self._open_turns(turn)
+        for seat in [s for s, a in self.asks.items() if a["turn"] not in opened]:
+            del self.asks[seat]                     # its turn is gone (a wolf ended the day): the answer is dropped
+            self.t.stale_results += 1
+        for t in opened:
+            if t.actor in self.t.human_seats:
+                continue
+            a = self.asks.get(t.actor)
+            if a is None or a["turn"] != t:
+                self._ask(t, turn_ctx, ahead=t != turn)
         await self._notify(ev)
+        await self._drain()
+
+    def _open_turns(self, turn: Turn) -> list[Turn]:
+        opener = getattr(self.t.env, "open_turns", None)
+        opened = (opener() if callable(opener) and self.t.cfg.parallel else []) or [turn]
+        return opened if opened[0] == turn else [turn]
+
+    def _ask(self, t: Turn, turn_ctx, ahead: bool) -> None:
+        view = self.t.env.observe(t.actor)
+        spec = self.t.env.action_space(t.actor, t.task)
+        v = self.version
+        job = AgentJob(self.id, t.actor, v, t.task, view, spec, self.t.memory.get(t.actor),
+                       make_player=lambda on_step, s=t.actor, task=t.task, v=v:
+                       self.t.make_player(s, on_step=on_step, task=task, version=v),
+                       on_step=self._step_from_thread,
+                       lane=self.t.cfg.lane or ("human" if self.t.human_seats else "online"),
+                       trace_ctx=turn_ctx)
+        self.asks[t.actor] = {"turn": t, "version": v, "view": fingerprint(view), "spec": spec_key(spec),
+                              "result": None, "since": time.time()}
+        if ahead:
+            self.t.asked_ahead += 1
+        self.executor.submit(job, self.post)
+
+    async def _drain(self) -> None:
+        """Commit the current turn if its answer is already in."""
+        turn = self.t.turn
+        if self.stopped or not isinstance(turn, Turn) or turn.actor in self.t.human_seats:
+            return
+        a = self.asks.get(turn.actor)
+        if a is None or a["turn"] != turn or a["result"] is None:
+            return
+        del self.asks[turn.actor]
+        r: AgentResult = a["result"]
+        view = self.t.env.observe(turn.actor)
+        spec = self.t.env.action_space(turn.actor, turn.task)
+        if fingerprint(view) != a["view"] or spec_key(spec) != a["spec"] or spec.check(r.action) is not None:
+            self.t.misses += 1                     # asked too early after all: ask again, now
+            self._ask(turn, tracing.trace.set_span_in_context(self._turn_span) if self._turn_span else None, ahead=False)
+            return
+        if r.meta.get("remote") and r.meta.get("trace"):
+            for st in r.meta["trace"]:          # a worker in another process cannot stream steps; they come with the result
+                self.t.traces.setdefault(r.seat, []).append({**st, "round": getattr(self.t.env, "_round", 0)})
+            self.t.traces[r.seat] = self.t.traces[r.seat][-40:]
+        agent_states = [(r.seat, r.memory[0], r.memory[1])] if r.memory else []
+        await self._commit(r.action, forced=r.forced, agent_states=agent_states, memory=(r.seat, r.memory))
 
     async def _human(self, m: HumanAction) -> dict:
         if m.seat not in self.t.human_seats:
@@ -251,9 +307,9 @@ class GameActor:
         return {"status": "accepted"} if ok else {"status": "unavailable", "reason": self.stopped}
 
     async def _agent_result(self, r: AgentResult) -> None:
-        if r.version != self.version or self.t.pending_seat is not None or not isinstance(self.t.turn, Turn) \
-                or self.t.turn.actor != r.seat:
-            # the world moved on (deadline fired, game recovered, a duplicate delivery)
+        a = self.asks.get(r.seat)
+        if self.stopped or a is None or a["version"] != r.version or a["result"] is not None:
+            # the world moved on (deadline fired, game recovered, the turn was dropped, a duplicate delivery)
             self.t.stale_results += 1
             if self.hooks.on_stale:
                 self.hooks.on_stale(self.t)
@@ -266,17 +322,14 @@ class GameActor:
             await self._notify(self.t.emit("error", message=self.t.error))
             self.stopped = "aborted"
             return
-        if r.meta.get("remote") and r.meta.get("trace"):
-            for st in r.meta["trace"]:          # a worker in another process cannot stream steps; they come with the result
-                self.t.traces.setdefault(r.seat, []).append({**st, "round": getattr(self.t.env, "_round", 0)})
-            self.t.traces[r.seat] = self.t.traces[r.seat][-40:]
-        agent_states = [(r.seat, r.memory[0], r.memory[1])] if r.memory else []
-        await self._commit(r.action, forced=r.forced, agent_states=agent_states, memory=(r.seat, r.memory))
+        a["result"] = r
+        await self._drain()
 
     async def _timer(self, m: TimerFired) -> None:
         if m.version != self.version or not isinstance(self.t.turn, Turn):
             return
         spec = self.t.env.action_space(self.t.turn.actor, self.t.turn.task)
+        self.asks.pop(self.t.turn.actor, None)
         await self._commit(spec.fallback, forced=True)
 
     # ------------------------------------------------------------ commit
