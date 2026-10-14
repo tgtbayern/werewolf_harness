@@ -67,6 +67,18 @@ async def test_an_open_breaker_skips_the_model_without_calling_it(hub):
     assert hub.sink.drain()[-2].fallback_reason == "breaker_open"
 
 
+async def test_an_open_breaker_on_the_only_model_still_lets_the_call_through(hub):
+    # nothing to fall back to: refusing would hand every turn to the rule seat
+    a = Fake("m-solo", ProviderError("upstream 503", status=503))
+    gw = _gw(hub, a)
+    for _ in range(2):
+        with pytest.raises(ProviderError):
+            gw.chat(MSG)
+    assert hub.breaker("m-solo").state == "open"
+    a.fail = None
+    assert gw.chat(MSG).model == "m-solo" and a.calls == 3
+
+
 async def test_wallet_and_key_errors_stop_immediately(hub):
     a, b = Fake("m-a", ProviderError("insufficient balance", status=402)), Fake("m-b")
     with pytest.raises(ProviderError):

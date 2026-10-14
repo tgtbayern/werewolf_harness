@@ -68,7 +68,7 @@ main.table { grid-template-columns: minmax(0, 1fr) 430px; }
 
 .list { flex: 1; min-height: 0; overflow: auto; }
 .lrow {
-  display: grid; grid-template-columns: 62px minmax(0,1fr) 104px 116px 104px 76px;
+  display: grid; grid-template-columns: 104px minmax(0,1fr) 104px 116px 112px 76px;
   gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--line-2); align-items: center;
 }
 .lrow.head { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em; color: var(--muted); border-bottom-color: var(--line); position: sticky; top: 0; background: var(--card); }
@@ -382,3 +382,10 @@ main.table { grid-template-rows: auto minmax(0, 1fr); }
 .turn .rowhead .lbl { font-size: 15px; font-style: normal; font-weight: 700; color: #f0d9b5; }
 .legend { margin-top: 26px; }
 .felt-box { padding-bottom: 18px; }
+
+/* The table never shrinks below a readable size: it takes its width from the
+ * column, not its height from whatever is left over, and the column scrolls. */
+.felt-wrap { overflow-y: auto; min-height: 0; padding-bottom: 12px; }
+.felt-box { flex: 0 0 auto; }
+.felt { height: auto; width: min(100%, 540px, 62vh); min-width: 360px; aspect-ratio: 1; }
+@media (max-width: 1120px) { .felt { width: min(100%, 520px); } }

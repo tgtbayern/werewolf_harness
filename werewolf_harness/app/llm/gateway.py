@@ -29,12 +29,15 @@ from ...players.budget import BudgetExhausted, estimate_messages
 from ...players.providers.base import LLMClient, LLMResponse, ProviderError
 from ...players.providers.mock import MockClient
 from ...players.recovery import is_terminal_refusal
+from ..obs import logging as olog
 from ..obs import metrics
 from ..obs.tracing import get_tracer
 from . import pricing
 from .breaker import Breaker
 from .limits import GameBudget, TokenLimiter
 from .sim import PrefixCache, SimClient
+
+log = olog.get("llm.gateway")
 
 
 @dataclass
@@ -167,7 +170,10 @@ class GatewayClient(LLMClient):
         reason: str | None = None
         for i, (model, client) in enumerate(self.chain):
             br = self.hub.breaker(model)
-            if not br.allow():
+            last = i == len(self.chain) - 1
+            # Failing fast is for moving on to the next model. With nothing after this one, a
+            # refusal would just hand the turn to the rule fallback, so the call is tried anyway.
+            if not br.allow() and not last:
                 reason = reason or "breaker_open"
                 self._record(model, "rejected", fallback_reason="breaker_open")
                 continue
@@ -193,6 +199,8 @@ class GatewayClient(LLMClient):
                     self._record(model, "error", latency_ms=ms, fallback_reason="terminal_refusal")
                     raise
                 why = classify(exc)
+                olog.kv(log, 30, "model call failed", model=model, game_id=self.game_id, seat=self.seat,
+                        kind=why or "client_error", status=exc.status, latency_ms=ms, detail=str(exc)[:400])
                 if why is None:
                     self._record(model, "error", latency_ms=ms, fallback_reason="client_error")
                     raise
