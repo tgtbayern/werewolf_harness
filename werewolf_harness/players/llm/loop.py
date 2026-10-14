@@ -11,8 +11,10 @@ be salvaged returns the environment's fallback and says so in ``last_turn``.
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +76,7 @@ class TurnResult:
     hallucinated_citations: list[dict] = field(default_factory=list)
     recovery: dict = field(default_factory=dict)
     model: str = ""
+    note_ms: int = 0                 # the part of latency_ms spent writing the note
 
     @property
     def fallback_used(self) -> str | None:
@@ -90,7 +93,7 @@ class LLMPlayer:
                  temperature: float = 0.7, max_tokens: int = 700, playbook: bool = True, forensics_gate: bool = False,
                  transport_budget: TransportBudget | None = None, anonymise_speakers: bool = False,
                  registry: InfoRegistry | None = None, token_budget: TokenBudget | None = None,
-                 on_step=None, lang: str = "zh"):
+                 on_step=None, lang: str = "zh", async_note: bool = False):
         self.client = client
         self.lang = lang
         self.guard = guard or GuardStack()
@@ -114,9 +117,48 @@ class LLMPlayer:
         self.note: str = ""
         self.history: list[TurnResult] = []
         self.last_turn: TurnResult | None = None
+        # The note is for this seat's NEXT turn, so nobody at the table has to wait for
+        # it: with async_note the action goes back to the driver at once and the note is
+        # written in the background, and the seat's next act() waits for it first.
+        self.async_note = async_note
+        self._note_thread: threading.Thread | None = None
+        self._note_error: BaseException | None = None
+        self._gen = 0                    # bumped by discard_last(): a note for a discarded turn is dropped
+        self._undo: tuple | None = None
+
+    # ------------------------------------------------------------ after the turn
+    def flush(self) -> None:
+        """Wait for the note still being written, and surface what went wrong in it."""
+        th = self._note_thread
+        if th is not None:
+            th.join()
+            self._note_thread = None
+        err, self._note_error = self._note_error, None
+        if err is not None:
+            raise err
+
+    def discard_last(self) -> None:
+        """Forget the last act(): the driver asked too early and threw the answer away.
+
+        Belief, note and history go back to what they were before it, so asking again
+        sees the seat exactly as the one-at-a-time loop would have.
+        """
+        if self._undo is None:
+            return
+        self._gen += 1
+        th = self._note_thread
+        if th is not None:
+            th.join()
+            self._note_thread = None
+        self._note_error = None
+        self.belief, self.note, n = self._undo
+        del self.history[n:]
+        self.last_turn = self.history[-1] if self.history else None
+        self._undo = None
 
     # ------------------------------------------------------------ the contract
     def act(self, view: dict, task: str, spec: ActionSpec, feedback: str | None) -> Any:
+        self.flush()
         if self.belief is None:
             self.belief = BeliefState(view["you"], list(range(1, view["num_players"] + 1)))
         if self.registry is None:
@@ -125,6 +167,7 @@ class LLMPlayer:
                             model=self.client.name)
         stats = RecoveryStats()
         self.last_forced = False
+        self._undo = (copy.deepcopy(self.belief), self.note, len(self.history))
         try:
             action = self._run(view, task, spec, feedback, result, stats)
         finally:
@@ -134,7 +177,8 @@ class LLMPlayer:
             # circuit breaker is aborting the game for too many fallbacks.
             self.last_forced = bool(stats.fallback_used)
             result.belief_after = self.belief.snapshot()
-            result.note_after = self.note
+            if self._note_thread is None:
+                result.note_after = self.note        # otherwise the note fills it in when it lands
             result.recovery = stats.to_dict()
             self.history.append(result)
             self.last_turn = result
@@ -247,7 +291,7 @@ class LLMPlayer:
                 self._file(result, step)
                 if call.name in ("speak", "campaign_run", "last_words"):
                     result.hallucinated_citations = evidence_mod.unsupported_citations(args["content"], speaker=view["you"], lookups=lookups)
-                self._write_note(messages, result, stats)
+                self._note(messages, result, stats)
                 return {"name": call.name, "args": args}
 
             # information tool
@@ -323,17 +367,32 @@ class LLMPlayer:
                 term = spec.tool(call.name)
                 if term is not None and not call.malformed and term.check(call.arguments) is None:
                     self._file(result, ReActStep(step_no + 1, action="<forced>", args=dict(call.arguments)))
-                    self._write_note(messages, result, stats)
+                    self._note(messages, result, stats)
                     return {"name": call.name, "args": term.normalise(call.arguments)}
         stats.fallback_used = stats.fallback_used or "default_action"
         fb = spec.fallback
         self._file(result, ReActStep(step_no + 1, action=f"{fb['name']}(default)", args=dict(fb.get("args") or {}), guard_blocked=True, block_reason="fallback"))
         if stats.fallback_used != "transport_failure":
-            self._write_note(messages, result, stats)
+            self._note(messages, result, stats)
         return fb
 
     # ------------------------------------------------------------ note to the next turn
-    def _write_note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats) -> None:
+    def _note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats) -> None:
+        if not self.async_note:
+            self._write_note(messages, result, stats, self._gen)
+            return
+        msgs, gen = list(messages), self._gen
+
+        def work():
+            try:
+                self._write_note(msgs, result, stats, gen)
+            except BaseException as exc:          # noqa: BLE001 -- re-raised by the seat's next flush()
+                if gen == self._gen:
+                    self._note_error = exc
+        self._note_thread = threading.Thread(target=work, name=f"note-{result.player_id}", daemon=True)
+        self._note_thread.start()
+
+    def _write_note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats, gen: int) -> None:
         """One extra call on the turn's own transcript: the model tells its next turn why.
 
         The environment records what the seat did and the belief table records
@@ -342,14 +401,17 @@ class LLMPlayer:
         empty reply keeps the previous note rather than blanking it.
         """
         response = self._call(messages + [{"role": "user", "content": NOTE_PROMPT}], None, stats)
-        if response is None:
-            return
-        result.prompt_tokens += response.prompt_tokens
-        result.completion_tokens += response.completion_tokens
-        result.latency_ms += response.latency_ms
-        text = (response.text or "").strip()
-        if text:
-            self.note = text[:NOTE_MAX_CHARS]
+        if gen != self._gen:
+            return                                   # the turn it belonged to was thrown away
+        if response is not None:
+            result.prompt_tokens += response.prompt_tokens
+            result.completion_tokens += response.completion_tokens
+            result.latency_ms += response.latency_ms
+            result.note_ms = response.latency_ms
+            text = (response.text or "").strip()
+            if text:
+                self.note = text[:NOTE_MAX_CHARS]
+        result.note_after = self.note
 
     def _file(self, result: TurnResult, step: ReActStep) -> None:
         """Record a step and let anyone watching see it as it happens.

@@ -40,11 +40,12 @@ def cmd_play(a: argparse.Namespace) -> int:
     tokens = TokenBudget(max_tokens=a.max_tokens, max_usd=a.max_usd)
     players = {s: LLMPlayer(_client(a.model, a.seed * 100 + s), guard=guard, transport_budget=budget,
                             token_budget=tokens, playbook=a.playbook != "none",
-                            temperature=a.temperature, lang=a.lang) for s in range(1, n + 1)}
+                            temperature=a.temperature, lang=a.lang, async_note=a.parallel > 1)
+               for s in range(1, n + 1)}
     t0 = time.time()
     crashed = None
     try:
-        ep = run(env, players, a.seed)
+        ep = run(env, players, a.seed, parallel=a.parallel)
     except GatewayExhausted as exc:
         crashed = str(exc)
         print(f"!! 网关不再作答：{exc}", file=sys.stderr)
@@ -56,7 +57,8 @@ def cmd_play(a: argparse.Namespace) -> int:
     dur = time.time() - t0
     truth = env.ground_truth()
     print(f"== {a.variant} seed={a.seed} model={a.model} guard={guard.label()} -> {ep.outcome['winner']} in round {ep.outcome['round']} "
-          f"({len(ep.journal)} turns, {dur:.0f}s)")
+          f"({len(ep.journal)} turns, {dur:.0f}s, parallel={a.parallel}"
+          + (f", {ep.misses} answers asked too early and thrown away" if ep.misses else "") + ")")
     h = ep.health
     print(f"   roles: {truth['roles']}")
     print(f"   健康度：{h.forced}/{h.turns} 回合兜底（{h.forced_rate:.1%}）"
@@ -72,6 +74,7 @@ def cmd_play(a: argparse.Namespace) -> int:
             "journal": [r.__dict__ for r in ep.journal],
             "turns": [t.to_dict() for p in players.values() for t in p.history],
             "night": env.night_records(), "pack_chat": env.pack_chat_log(),
+            "parallel": a.parallel, "timings": ep.timings, "misses": ep.misses,
         }
         with open(a.out, "w") as f:
             json.dump(log, f, ensure_ascii=False, indent=1, default=str)
@@ -210,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--max-usd", type=float, default=None, dest="max_usd")
     pl.add_argument("--out", default=None)
     pl.add_argument("--lang", default="zh", choices=["zh", "en"], help="AI 发言用的语言")
+    pl.add_argument("--parallel", type=int, default=8,
+                    help="最多几个座位同时想（投票、复盘、夜里互不依赖的角色）；1 = 一个一个来")
     rp = sub.add_parser("replay")
     rp.add_argument("file")
     rp.add_argument("--upto", type=int, default=None)

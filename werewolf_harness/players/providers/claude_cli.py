@@ -35,6 +35,12 @@ Settings (read from the .env dict first, then the process environment):
                           discovery. Bare mode authenticates ONLY with
                           ANTHROPIC_API_KEY, never with a subscription login.
   CLAUDE_CLI_EXTRA_ARGS   extra flags appended verbatim, e.g. ``--effort low``
+  CLAUDE_CLI_LEAN         1 (default) = start the CLI lean: no user/project settings files
+                          (--setting-sources=) and no update check or telemetry
+                          (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, DISABLE_AUTOUPDATER).
+                          Measured on an M-series Mac, the time a call spends outside the
+                          model fell from 1.58 s to 0.23 s; at ~150 calls a game that is
+                          over three minutes. Login still comes from the keychain.
 """
 from __future__ import annotations
 
@@ -143,6 +149,7 @@ class ClaudeCLIClient(LLMClient):
         self.extra_args = list(extra_args) if extra_args is not None else shlex.split(_setting("CLAUDE_CLI_EXTRA_ARGS", env))
         # An empty working directory, so no project CLAUDE.md or settings leak into a seat.
         self.cwd = cwd or tempfile.mkdtemp(prefix="werewolf-claude-cli-")
+        self.lean = _setting("CLAUDE_CLI_LEAN", env, "1") not in ("0", "false", "no")
 
     # ------------------------------------------------------------ command line
     def command(self, system: str) -> list[str]:
@@ -152,10 +159,15 @@ class ClaudeCLIClient(LLMClient):
             cmd += ["--model", self.cli_model]
         if self.bare:
             cmd.append("--bare")
+        if self.lean:
+            cmd.append("--setting-sources=")
         return cmd + self.extra_args
 
     def _env(self) -> dict:
         env = dict(os.environ)
+        if self.lean:
+            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            env.setdefault("DISABLE_AUTOUPDATER", "1")
         # A key put in .env reaches the CLI only when asked for: without --bare the CLI prefers
         # an ANTHROPIC_API_KEY over the subscription login, which would move the bill silently.
         if self.bare and self.env.get("ANTHROPIC_API_KEY"):

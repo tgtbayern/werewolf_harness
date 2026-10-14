@@ -94,6 +94,12 @@ def test_the_command_line_switches_claude_code_off(fake):
     assert system.startswith("RULES OF THE TABLE") and "TOOL PROTOCOL" in system and "vote(" in system
     assert call["stdin"] == "Vote now."
     assert "--bare" not in argv and not os.listdir(call["cwd"])     # an empty working directory
+    assert "--setting-sources=" in argv                              # lean start: no settings files
+
+
+def test_lean_start_can_be_switched_off(fake):
+    ClaudeCLIClient("claude-cli", env={**fake["env"], "CLAUDE_CLI_LEAN": "0"}).chat(MSGS, tools=VOTE, timeout=20)
+    assert "--setting-sources=" not in fake["last"]()["argv"]
 
 
 def test_plain_claude_cli_uses_the_cli_default_model(fake):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 
 _CJK = re.compile(r"[\u3000-\u9fff\uff00-\uffef]")
@@ -78,6 +79,9 @@ class TokenBudget:
     calls: int = 0
     gateway_prompt_tokens: int = 0                   # what the relay claimed, for comparison only
     gateway_completion_tokens: int = 0
+    # seats decide in parallel (votes, the review, independent night roles), so the
+    # counters are shared across threads
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def total_tokens(self) -> int:
@@ -90,6 +94,10 @@ class TokenBudget:
 
     def spend(self, *, prompt: int, completion: int,
               gateway_prompt: int = 0, gateway_completion: int = 0) -> None:
+        with self._lock:
+            self._spend(prompt, completion, gateway_prompt, gateway_completion)
+
+    def _spend(self, prompt: int, completion: int, gateway_prompt: int, gateway_completion: int) -> None:
         self.calls += 1
         self.prompt_tokens += prompt
         self.completion_tokens += completion

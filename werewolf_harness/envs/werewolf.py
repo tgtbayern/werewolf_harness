@@ -94,6 +94,11 @@ NIGHT_ACTIONS: dict[str, tuple[str, ...]] = {
     "hunter": (),
 }
 NIGHT_PRIORITY = {"seer": 10, "guard": 20, "werewolf": 30, "witch": 40}
+# Night roles whose choice reads nothing another night actor writes: the seer's check
+# and the guard's shield do not depend on the knife, and nothing they do is shown to
+# anyone else before dawn. The wolves read each other's intents and the witch reads
+# the pack's choice, so they wait their turn.
+INDEPENDENT_AT_NIGHT = frozenset({"seer", "guard"})
 
 TASK_TERMINALS: dict[str, tuple[str, ...]] = {
     "night": ("night_check", "night_kill", "night_save", "night_poison", "night_protect", "night_skip"),
@@ -263,9 +268,9 @@ class Werewolf:
                          for d in self._deaths],
                 "speech_order": order,
                 "speeches": [s.to_dict() for s in self._speeches],
-                "votes": {r: dict(b) for r, b in self._votes.items()},
+                "votes": {r: dict(b) for r, b in self._votes.items() if self._ballots_open(r)},
                 "vote_counts": {r: dict(Counter(t for t in b.values() if t is not None))
-                                for r, b in self._votes.items()},
+                                for r, b in self._votes.items() if self._ballots_open(r)},
                 "exiles": dict(self._exiles),
                 "sheriff": self._sheriff,
                 "sheriff_candidates": list(self._candidates),
@@ -295,7 +300,7 @@ class Werewolf:
         if role == "witch":
             priv["antidote_available"] = self._antidote
             priv["poison_available"] = self._poison
-        if self._phase == "night" and self._night_actor() == actor:
+        if self._phase == "night" and actor in self._open_night_actors():
             v["night"] = self._night_options(actor)
         if self._phase == "review":
             v["review"] = self._review_handout()
@@ -331,11 +336,62 @@ class Werewolf:
             "speeches": [sp.to_dict() for sp in self._speeches],
             "votes": {r: dict(b) for r, b in self._votes.items()},
             "exiles": dict(self._exiles),
-            "said": [dict(e) for e in self._review_chat],
+            # this round's remarks stay hidden until the round is over: every seat writes
+            # its round at once, so each one answers what was said before, never beside it
+            "said": [dict(e) for e in self._review_chat if e["round"] <= self._review_round],
             "round": self._review_round + 1,
             "rounds_max": self._review_cap(),
             "seats": list(self._review_seats()),
         }
+
+    # ================================================================ concurrency
+    def open_turns(self) -> list[Turn]:
+        """Every turn that may be decided right now, the one ``step`` expects next first.
+
+        Optional part of the arena contract. A turn is open when nothing committed
+        before it, in journal order, can change what its actor sees or may do --
+        so a driver may ask all of them at once and still commit them one by one,
+        in the order ``step`` asks for them. The journal, and with it replay, is
+        exactly what the one-at-a-time loop would have written.
+
+          day vote / badge vote  every voter: ballots are sealed until the last one is in
+          review                 every seat left in this round: a round is written at once
+          night                  the seer and the guard, the first wolf still to name a
+                                 kill, and the witch once the pack has chosen
+          everything else        nothing: a speech answers the speech before it
+
+        Pure read: never moves the world.
+        """
+        if self._phase == "day_vote":
+            cast = self._votes.get(self._round, {})
+            return [Turn(s, "vote") for s in self._day_voters if s in self._alive and s not in cast]
+        if self._phase == "campaign_vote":
+            return [Turn(s, "campaign_vote") for s in self._electorate() if s not in self._sheriff_votes]
+        if self._phase == "night":
+            return [Turn(s, "night") for s in self._open_night_actors()]
+        if self._phase == "review":
+            if self._review_speaker() is None:
+                return []
+            return [Turn(s, "review") for s in self._review_seats()[self._review_cursor:]]
+        return []
+
+    def _ballots_open(self, rnd: int) -> bool:
+        """A day's ballots are public once that vote is over, never while it is running."""
+        return not (self._phase == "day_vote" and rnd == self._round)
+
+    def _open_night_actors(self) -> list[int]:
+        if self._phase != "night":
+            return []
+        pending = [s for s in self._night_queue if s not in self._night_done and s in self._alive]
+        wolves_left = [s for s in pending if self._roles[s] == "werewolf"]
+        out = []
+        for s in pending:
+            role = self._roles[s]
+            if role in INDEPENDENT_AT_NIGHT \
+                    or (role == "werewolf" and s == wolves_left[0]) \
+                    or (role not in ("werewolf",) and not wolves_left):
+                out.append(s)
+        return out
 
     # ================================================================ action_space
     def action_space(self, actor: int, task: str) -> ActionSpec:
@@ -1116,7 +1172,7 @@ class Werewolf:
         if counts.get("witch"):
             lines.append("The witch may use her antidote on herself." if v.witch_self_save else self.RULES["witch_self"])
         lines += [
-            "Each day every living player speaks once, in a fixed order, and then everyone votes. The player with the most votes is exiled; a tie exiles nobody.",
+            "Each day every living player speaks once, in a fixed order, and then everyone votes at the same time: nobody sees a ballot until all are cast. The player with the most votes is exiled; a tie exiles nobody.",
             "",
             "Night actions are decided by the players who hold them: the seer chooses who to check, each wolf names a kill and the pack's majority stands, and the witch chooses whether to spend her antidote or her poison.",
         ]
@@ -1135,7 +1191,8 @@ class Werewolf:
         if v.review_rounds > 0:
             lines.append(f"When the game ends the result is already final and nothing said afterwards can move it. Every player then -- everyone, "
                          f"alive and dead -- is shown the whole truth of the game: every role, every night action, every check, and what the wolves "
-                         f"said to each other in private. On his turn each player either speaks or passes; this review (复盘) ends as soon as one "
+                         f"said to each other in private. The review goes in rounds; in each round every player at once either speaks or passes, and sees what the others said "
+                         f"only when the round is over. This review (复盘) ends as soon as one "
                          f"whole round goes by with every player passing, and in any case after {v.review_rounds} rounds.")
         lines += [
             "",

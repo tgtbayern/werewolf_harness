@@ -19,6 +19,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import contextvars
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -90,10 +91,13 @@ class TransportBudget:
 
     limit: int = 10
     failures: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def spend(self) -> None:
-        self.failures += 1
-        if self.failures > self.limit:
+        with self._lock:
+            self.failures += 1
+            over = self.failures > self.limit
+        if over:
             raise GatewayExhausted(
                 f"模型连续答不上来：{self.failures} 个回合被兜底，超过上限 {self.limit}。"
                 "这一局作废，不入库。"
