@@ -24,6 +24,9 @@ from .players import (BudgetExhausted, GatewayExhausted, GuardStack, LLMPlayer, 
 def _client(model: str, seed: int):
     if model == "mock":
         return MockClient(seed=seed)
+    from .players.providers.claude_cli import ClaudeCLIClient, is_cli_model
+    if is_cli_model(model):
+        return ClaudeCLIClient(model)
     key = os.getenv("LLM_API_KEY", "")
     base = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     return OpenAICompatClient(model, api_key=key, base_url=base, tool_mode=os.getenv("LLM_TOOL_MODE", "native"))

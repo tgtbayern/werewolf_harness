@@ -69,12 +69,16 @@ const GUARD_WHY = {
 const SHORT = {
   "gemini-3.8-flash": "gemini", "gpt-5.6-terra": "terra", "gpt-5.6-sol": "sol",
   "claude-sonnet-5": "sonnet", "claude-opus-5": "opus", mock: "mock", script: "script",
+  "claude-cli:sonnet": "cc-sonnet", "claude-cli:haiku": "cc-haiku", "claude-cli:opus": "cc-opus", "claude-cli": "cc",
   "deepseek-v4-flash": "ds-flash", "deepseek-v4-pro": "ds-pro",
   "kimi-k3": "kimi-k3", "kimi-k2.6": "kimi-k2.6", "glm-5.3": "glm-5.3",
 };
 // 12 次实测（2026-09-03，最大的那个 prompt）。数字在 providers/__init__.py 里，
 // 这里只是同一份测量结果的人话版本。
 const MODEL_WHY = {
+  "claude-cli:sonnet": "本机 Claude Code（claude -p），用 CLI 登录的账号，不要 API key。每次调用多 1–2 秒起进程。",
+  "claude-cli:haiku": "本机 Claude Code 的 haiku：最快、最省额度。",
+  "claude-cli:opus": "本机 Claude Code 的 opus：最强，也最吃订阅额度。",
   "deepseek-v4-flash": "1 秒出手，最便宜。思考模式关掉了——ReAct 循环本来就在逼它一步步想。",
   "deepseek-v4-pro": "1.4 秒，同一家的旗舰。想看便宜档和贵档差多少就摆一起。",
   "glm-5.3": "4 秒。始终思考关不掉，已把 reasoning_effort 压到 low 控成本。",

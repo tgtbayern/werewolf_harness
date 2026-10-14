@@ -244,6 +244,8 @@ def _err_status(msg: str):
 def _provider(model: str) -> str:
     if model in ("mock", "script") or model.startswith("sim"):
         return "local"
+    if model == "claude-cli" or model.startswith("claude-cli:"):
+        return "Claude Code CLI"
     try:
         from ...players.providers import provider_of
         p = provider_of(model)

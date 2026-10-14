@@ -1,4 +1,6 @@
 from .base import LLMClient, LLMResponse, ProviderError, ToolCall
+from . import claude_cli
+from .claude_cli import ClaudeCLIClient, is_cli_model
 from .china import CANDIDATES, CANDIDATE_BY_MODEL, PROVIDERS, Candidate, Provider, provider_of
 from .mock import MockClient
 from .openai_compat import OpenAICompatClient
@@ -55,6 +57,10 @@ def profile(model: str) -> dict:
     """
     if model in PROFILES:
         return PROFILES[model]
+    if is_cli_model(model):
+        # A CLI call pays a process start (1-2 s) on top of the model; 120 s matches the
+        # relay's claude rows, which take the same JSON path.
+        return {"tool_mode": "json_prompt", "timeout_s": 120.0, "note": "本机 Claude Code（claude -p），走 JSON 协议"}
     c = CANDIDATE_BY_MODEL.get(model)
     if c is not None:
         return {"tool_mode": "native", "timeout_s": c.timeout_s, "note": c.note,
@@ -74,6 +80,9 @@ def offered(env_keys: dict | None = None) -> list[str]:
     if env_keys is not None:
         out += [c.model for c in CANDIDATES
                 if env_keys.get(PROVIDERS[c.provider].env_key) and not c.retired]
+        # The local CLI needs no key, only the executable: offered when it can be found.
+        if claude_cli.available(env_keys):
+            out += list(claude_cli.MENU)
     return out
 
 

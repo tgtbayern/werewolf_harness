@@ -21,7 +21,7 @@ from ..envs import VARIANTS, Werewolf
 from ..players import (BudgetExhausted, GatewayExhausted, GuardStack, HumanPlayer, LLMPlayer,
                        MockClient, OpenAICompatClient, RandomPlayer, RecoveryPolicy, TokenBudget,
                        TransportBudget)
-from ..players.providers import PROVIDERS, provider_of, profile, retired
+from ..players.providers import PROVIDERS, ClaudeCLIClient, is_cli_model, provider_of, profile, retired
 
 _ids = itertools.count(1)
 
@@ -74,12 +74,15 @@ def _public_action(record) -> dict:
 def _client(model: str, seed: int, env_keys: dict):
     """The client for one seat.
 
-    Two worlds: a model reached through the relay (one base_url, keys grouped by
-    vendor), and a Chinese model reached directly (its own base_url, its own key,
-    its own body quirks). The seat cannot tell the difference.
+    Three worlds: a model reached through the relay (one base_url, keys grouped by
+    vendor), a Chinese model reached directly (its own base_url, its own key,
+    its own body quirks), and the local Claude Code CLI (`claude-cli:<model>`,
+    no key -- whatever the CLI is signed in with). The seat cannot tell the difference.
     """
     if model == "mock":
         return MockClient(seed=seed)
+    if is_cli_model(model):
+        return ClaudeCLIClient(model, env=env_keys)
     p = profile(model)
     direct = provider_of(model)
     if direct is not None:

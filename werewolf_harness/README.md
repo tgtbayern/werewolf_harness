@@ -32,6 +32,14 @@ make test         # 全部测试；make test-core 不需要数据库
 模型选 `mock`（离线、秒回）或 `sim` / `sim-cheap` / `sim-flaky`：模拟供应商，带延迟、故障和前缀缓存，用于压测和演练。
 真模型需要在 `.env` 里配置 key，见 `.env.example`。
 
+也可以不用 API key，直接用本机的 Claude Code 当模型：座位选 `claude-cli:sonnet` / `claude-cli:haiku` / `claude-cli:opus`（或 `claude-cli`，用 CLI 的默认模型）。每次调用就是一次 `claude -p`，用的是 CLI 当前登录的账号（订阅或 API key），Claude Code 自带的工具全部关掉、系统提示整个替换成本局的提示词、不保存会话，回复按 JSON 工具协议解析。只要 `claude` 在 PATH 上，开局页面的模型列表里就会出现这几项，可以和 API 模型混坐一桌。
+
+```
+python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku
+```
+
+注意：CLI 不支持 temperature 和 max_tokens，这两个参数对它无效；每次调用要多花 1–2 秒启动进程；同时最多起 `CLAUDE_CLI_CONCURRENCY`（默认 4）个进程，其余排队。没登录时第一次调用就会停局并提示去 `claude` 里登录；订阅额度用完时按限流处理，切到备用模型。工作目录是一个空的临时目录，项目里的 CLAUDE.md 不会被带进来；但用户级的 `~/.claude` 设置和 CLAUDE.md 仍可能被加载，想完全隔离就设 `CLAUDE_CLI_BARE=1`（只能用 API key 认证）。
+
 ## 在线服务做了什么
 
 | 能力 | 做法 | 代码 / 文档 |
@@ -41,7 +49,7 @@ make test         # 全部测试；make test-core 不需要数据库
 | 崩溃恢复 | 重放 journal，并从 `agent_state` 恢复模型座位的信念表和笔记；已提交的回合不重新问模型 | `runtime.py`、`scripts/chaos_demo.py` |
 | 多节点 | Redis 租约 + Postgres fencing token；被暂停后醒来的旧节点无法写入 | ADR 0004 |
 | 回合计时 | 分层时间轮（O(1) 挂 / 撤） | `app/runtime/timers.py` |
-| 模型调用层 | 回退链、熔断器、按 token 的令牌桶（Redis + Lua）、每局预算、逐次记账、按任务路由模型 | `app/llm/gateway.py` |
+| 模型调用层 | 回退链、熔断器、按 token 的令牌桶（Redis + Lua）、每局预算、逐次记账、按任务路由模型；模型可以是各家 API，也可以是本机 `claude -p` | `app/llm/gateway.py`、`players/providers/claude_cli.py` |
 | 模型任务队列 | Redis Streams：三条优先级流、至少一次投递、XAUTOCLAIM 认领、死信 | ADR 0005 |
 | 局不卡死 | 所有模型都失败时，规则座位按信念表出手 | `app/runtime/rules_npc.py` |
 | 实时通信 | WebSocket（心跳、断线按 `last_seq` 续传、单连接令牌桶）+ 观战用 SSE | `app/api/main.py` |
