@@ -165,7 +165,7 @@ class Runtime:
         table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
                       created=row["created_at"].timestamp())
         table.state = row["state"]
-        rows = await self.store.journal(gid)
+        rows = await self.store.journal(gid, archived=row.get("archived_at") is not None)
         self.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows])
         table.outcome, table.error = row["outcome"], row["error"]
         if table.state in ("over", "aborted", "crashed"):
@@ -198,27 +198,60 @@ class Runtime:
             if row is None or row["state"] not in ("waiting", "running"):
                 await self.leases.release(gid)
                 return None
-            table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
-                          created=row["created_at"].timestamp(), hub=self.hub)
-            table.state = row["state"]
-            table.resumed_from = row.get("resumed_from")
             rows = await self.store.journal(gid)
-            self.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows],
-                        request_ids={r.request_id: r.seq for r in rows if r.request_id})
-            table.memory = await self.store.agent_memory(gid)
-            table.recoveries += 1
-            table.emit("phase", phase="resume", round=getattr(table.env, "_round", 0), turns=len(table.journal),
-                       node=self.node)
-            actor = self._actor(table, token)
-            actor.launch()
-            self.counters["adopted"] += 1
-            olog.kv(log, 20, "adopted", game_id=gid, steps=len(rows), ms=round((time.monotonic() - t0) * 1000, 1),
-                    token=token, memory_seats=len(table.memory))
-            for fn in self.listeners:
-                fn("adopted", {"game_id": gid, "ms": (time.monotonic() - t0) * 1000})
-            return actor
+            return self._resume(gid, token, row, rows, await self.store.agent_memory(gid), t0)
         finally:
             self._adopting.discard(gid)
+
+    async def adopt_many(self, gids: list[str]) -> int:
+        """adopt() for a batch: the same steps, but each one is a single round trip for
+        the whole batch (leases in one pipeline, fencing bumped and game rows returned by
+        one UPDATE, journals and memory in one query each). One by one, each adoption was
+        ~8 ms of driver round trips around ~2 ms of replay (docs/db_scale.md)."""
+        gids = [g for g in dict.fromkeys(gids) if g not in self.actors and g not in self._adopting]
+        if not gids or self.draining:
+            return 0
+        self._adopting.update(gids)
+        try:
+            t0 = time.monotonic()
+            won = await self.leases.acquire_many(gids)
+            claimed = await self.store.claim_live(won, self.node) if won else {}
+            for g in won:
+                if g not in claimed:                         # ended (or vanished) since the scan read it
+                    await self.leases.release(g)
+            journals = await self.store.journals(list(claimed))
+            memories = await self.store.agent_memories(list(claimed))
+            n = 0
+            for gid, (token, row) in claimed.items():
+                try:
+                    self._resume(gid, token, row, journals[gid], memories.get(gid, {}), t0)
+                    n += 1
+                except Exception as exc:                      # noqa: BLE001 -- one broken game must not keep the rest down
+                    olog.kv(log, 40, "adoption failed", game_id=gid, error=repr(exc))
+                    await self.leases.release(gid)
+            return n
+        finally:
+            self._adopting.difference_update(gids)
+
+    def _resume(self, gid: str, token: int, row: dict, rows: list, memory: dict, t0: float) -> GameActor:
+        table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
+                      created=row["created_at"].timestamp(), hub=self.hub)
+        table.state = row["state"]
+        table.resumed_from = row.get("resumed_from")
+        self.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows],
+                    request_ids={r.request_id: r.seq for r in rows if r.request_id})
+        table.memory = memory
+        table.recoveries += 1
+        table.emit("phase", phase="resume", round=getattr(table.env, "_round", 0), turns=len(table.journal),
+                   node=self.node)
+        actor = self._actor(table, token)
+        actor.launch()
+        self.counters["adopted"] += 1
+        olog.kv(log, 20, "adopted", game_id=gid, steps=len(rows), ms=round((time.monotonic() - t0) * 1000, 1),
+                token=token, memory_seats=len(table.memory))
+        for fn in self.listeners:
+            fn("adopted", {"game_id": gid, "ms": (time.monotonic() - t0) * 1000})
+        return actor
 
     @staticmethod
     def replay(table: Table, journal: list[Record], request_ids: dict | None = None) -> None:
@@ -237,12 +270,18 @@ class Runtime:
         table.request_ids = dict(request_ids or {})
 
     async def scan(self) -> int:
+        """Adopt every live game nobody holds.
+
+        At startup after a full outage that is every live game: the scan asks Redis about
+        all of them in one MGET, then adopts them `recovery_batch` at a time (adopt_many).
+        """
+        live = [g["id"] for g in await self.store.live_games() if g["id"] not in self.actors]
+        holders = await self.leases.holders(live)
+        orphans = [g for g in live if holders.get(g) is None]
+        step = max(1, self.s.recovery_batch)
         n = 0
-        for g in await self.store.live_games():
-            if g["id"] in self.actors:
-                continue
-            if await self.leases.holder(g["id"]) is None and await self.adopt(g["id"]):
-                n += 1
+        for i in range(0, len(orphans), step):
+            n += await self.adopt_many(orphans[i:i + step])
         return n
 
     async def _scan_loop(self) -> None:

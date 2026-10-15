@@ -43,6 +43,16 @@ class Leases:
     async def acquire(self, game_id: str) -> bool:
         return bool(await self.r.set(self.key(game_id), self.node, nx=True, px=self.ttl_ms))
 
+    async def acquire_many(self, game_ids: list[str]) -> list[str]:
+        """acquire() for a batch in one pipeline (not a transaction: each SET NX stands
+        alone, exactly as if sent one by one). Returns the ids we now hold."""
+        if not game_ids:
+            return []
+        pipe = self.r.pipeline(transaction=False)
+        for g in game_ids:
+            pipe.set(self.key(g), self.node, nx=True, px=self.ttl_ms)
+        return [g for g, ok in zip(game_ids, await pipe.execute(), strict=True) if ok]
+
     async def renew(self, game_id: str) -> bool:
         return bool(await self._renew(keys=[self.key(game_id)], args=[self.node, self.ttl_ms]))
 
@@ -52,3 +62,10 @@ class Leases:
     async def holder(self, game_id: str) -> str | None:
         v = await self.r.get(self.key(game_id))
         return v.decode() if isinstance(v, bytes) else v
+
+    async def holders(self, game_ids: list[str]) -> dict[str, str | None]:
+        """Who holds each lease, in one MGET (the recovery scan asks about every live game)."""
+        if not game_ids:
+            return {}
+        vals = await self.r.mget([self.key(g) for g in game_ids])
+        return {g: (v.decode() if isinstance(v, bytes) else v) for g, v in zip(game_ids, vals, strict=True)}

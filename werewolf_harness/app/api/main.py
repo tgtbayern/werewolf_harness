@@ -5,6 +5,8 @@ Run:  uvicorn werewolf_harness.app.api.main:app  (or `python -m werewolf_harness
 from __future__ import annotations
 
 import asyncio
+import base64
+import datetime
 import json
 import os
 import pathlib
@@ -162,6 +164,22 @@ def seat_from(request: Request, game_id: str, seat: int | None, authorization: s
     return seat if got == seat else None
 
 
+def _cursor_out(row: dict) -> str:
+    """A page cursor: the last row's (created_at, id), opaque to clients (base64url, no '+' to mangle)."""
+    raw = f"{row['created_at'].isoformat()}~{row['id']}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _cursor_in(cursor: str | None) -> tuple | None:
+    if not cursor:
+        return None
+    try:
+        ts, gid = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode().split("~", 1)
+        return datetime.datetime.fromisoformat(ts), gid
+    except (ValueError, UnicodeDecodeError) as e:
+        raise HTTPException(400, "bad cursor") from e
+
+
 # ------------------------------------------------------------------ routes
 def _routes(app: FastAPI) -> None:
 
@@ -237,11 +255,16 @@ def _routes(app: FastAPI) -> None:
                 "profiles": PROFILES, "guards": ["无", "L1", "L1+L2", "L1+L2+L3"]}
 
     @app.get("/api/games")
-    async def games(request: Request):
+    async def games(request: Request, before: str | None = None, n: int = Query(50, ge=1, le=200)):
+        """The lobby: games this node drives, then the newest from the database.
+        `before` is the previous page's `next` cursor (keyset pagination: no OFFSET)."""
         s = svc(request)
-        live = {gid: a.t.summary() for gid, a in s.rt.actors.items()}
+        cursor = _cursor_in(before)
+        live = {gid: a.t.summary() for gid, a in s.rt.actors.items()} if cursor is None else {}
         out = list(live.values())
-        for g in await s.store.recent_games(50):
+        page = await s.store.recent_games(n, before=cursor)
+        nxt = _cursor_out(page[-1]) if len(page) == n else None
+        for g in page:
             if g["id"] in live:
                 continue
             t = s.rt.table(g["id"])
@@ -258,7 +281,13 @@ def _routes(app: FastAPI) -> None:
                         "xray": cfg.get("xray", False), "node": g["owner_node"],
                         "health": {"turns": 0, "forced_rate": 0, "usable": True, "forced": 0, "tokens": 0},
                         "created": g["created_at"].timestamp()})
-        return FastJSON({"games": sorted(out, key=lambda x: -x.get("created", 0))})
+        return FastJSON({"games": sorted(out, key=lambda x: -x.get("created", 0)), "next": nxt})
+
+    @app.get("/api/me/games")
+    async def my_games(request: Request, before: str | None = None, n: int = Query(20, ge=1, le=100),
+                       user: dict = Depends(current_user)):
+        page = await svc(request).store.user_games(user["id"], n, before=_cursor_in(before))
+        return FastJSON({"games": page, "next": _cursor_out(page[-1]) if len(page) == n else None})
 
     @app.post("/api/games", status_code=201)
     async def create(request: Request, body: dict, user: dict = Depends(current_user)):
@@ -375,10 +404,11 @@ def _routes(app: FastAPI) -> None:
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
     @app.get("/api/stats/llm")
-    async def llm_stats(request: Request, game: str | None = None):
+    async def llm_stats(request: Request, game: str | None = None, hours: float = Query(24, ge=0)):
+        """One game's usage, or the last `hours` (hours=0: all time -- a full scan of llm_calls)."""
         s = svc(request)
         await s.rt.flush_calls()
-        return await s.store.call_stats(game)
+        return await s.store.call_stats(game, hours=hours or None)
 
     # ---------------------------------------------------------- leaderboard
     @app.get("/api/leaderboard")

@@ -112,11 +112,25 @@ class Store:
                 "WHERE state IN ('waiting', 'running') ORDER BY created_at"))).mappings().all()
         return [dict(r) for r in rows]
 
-    async def recent_games(self, limit: int = 50) -> list[dict]:
+    async def recent_games(self, limit: int = 50, before: tuple | None = None) -> list[dict]:
+        """Newest first, one page. `before` = (created_at, id) of the last row of the
+        previous page: keyset pagination on games_created_idx, so page 200 costs what
+        page 1 costs (OFFSET would read and throw away every row before it)."""
+        where, args = "", {"n": limit}
+        if before is not None:
+            where, args = "WHERE (created_at, id) < (:bt, :bid) ", {**args, "bt": before[0], "bid": before[1]}
         async with self.engine.connect() as c:
             rows = (await c.execute(text(
                 "SELECT id, variant, seed, config, state, outcome, error, owner_node, created_at, ended_at "
-                "FROM games ORDER BY created_at DESC LIMIT :n"), {"n": limit})).mappings().all()
+                f"FROM games {where}ORDER BY created_at DESC, id DESC LIMIT :n"), args)).mappings().all()
+        return [{**dict(r), "config": _j(r["config"]), "outcome": _j(r["outcome"])} for r in rows]
+
+    async def finished_games(self, limit: int = 500) -> list[dict]:
+        """The newest `limit` games that ended normally (verify_replay's sample)."""
+        async with self.engine.connect() as c:
+            rows = (await c.execute(text(
+                "SELECT id, seed, config, outcome FROM games WHERE state = 'over' "
+                "ORDER BY created_at DESC, id DESC LIMIT :n"), {"n": limit})).mappings().all()
         return [{**dict(r), "config": _j(r["config"]), "outcome": _j(r["outcome"])} for r in rows]
 
     async def seats(self, game_id: str) -> list[dict]:
@@ -128,18 +142,31 @@ class Store:
     async def claim_seat(self, game_id: str, seat: int, user_id: str) -> bool:
         """First person to claim a human seat owns it; the same person may claim it again."""
         async with self.engine.begin() as c:
+            # game_created_at is the game's created_at copied onto the seat, so "my games,
+            # newest first" is one index range (game_seats_user_time_idx), not a join + sort
             r = await c.execute(text(
-                "UPDATE game_seats SET user_id = :u WHERE game_id = :g AND seat = :s AND kind = 'human' "
+                "UPDATE game_seats SET user_id = :u, "
+                "game_created_at = (SELECT created_at FROM games WHERE id = :g) "
+                "WHERE game_id = :g AND seat = :s AND kind = 'human' "
                 "AND (user_id IS NULL OR user_id = :u) RETURNING seat"), {"g": game_id, "s": seat, "u": user_id})
             return r.first() is not None
 
-    async def user_games(self, user_id: str, limit: int = 20) -> list[dict]:
-        """Served by game_seats_user_idx (user_id, game_id)."""
+    async def user_games(self, user_id: str, limit: int = 20, before: tuple | None = None) -> list[dict]:
+        """A player's games, newest first; `before` = (created_at, id) of the previous page's last row.
+
+        Served by game_seats_user_time_idx (user_id, game_created_at DESC, game_id DESC):
+        the newest `limit` seats are read straight off the index, then `limit` games by
+        primary key. Joining first and sorting after read every game the player ever sat in.
+        """
+        where, args = "", {"u": user_id, "n": limit}
+        if before is not None:
+            where = "AND (s.game_created_at, s.game_id) < (:bt, :bid) "
+            args.update(bt=before[0], bid=before[1])
         async with self.engine.connect() as c:
             rows = (await c.execute(text(
                 "SELECT g.id, g.variant, g.state, g.outcome, s.seat, g.created_at FROM game_seats s "
-                "JOIN games g ON g.id = s.game_id WHERE s.user_id = :u ORDER BY g.created_at DESC LIMIT :n"),
-                {"u": user_id, "n": limit})).mappings().all()
+                f"JOIN games g ON g.id = s.game_id WHERE s.user_id = :u {where}"
+                "ORDER BY s.game_created_at DESC NULLS LAST, s.game_id DESC LIMIT :n"), args)).mappings().all()
         return [{**dict(r), "outcome": _j(r["outcome"])} for r in rows]
 
     # ------------------------------------------------------------ ownership
@@ -152,6 +179,20 @@ class Store:
         if tok is None:
             raise KeyError(game_id)
         return int(tok)
+
+    async def claim_live(self, game_ids: list[str], node: str) -> dict[str, tuple[int, dict]]:
+        """bump_fencing() for a batch of games whose leases we just won, returning each
+        new token with the game row -- only for games still live (the others are left
+        untouched; the caller hands their leases back)."""
+        if not game_ids:
+            return {}
+        async with self.engine.begin() as c:
+            rows = (await c.execute(text(
+                "UPDATE games SET fencing_token = fencing_token + 1, owner_node = :n "
+                "WHERE id = ANY(:ids) AND state IN ('waiting', 'running') "
+                "RETURNING id, seed, config, state, created_at, resumed_from, fencing_token"),
+                {"ids": list(game_ids), "n": node})).mappings().all()
+        return {r["id"]: (int(r["fencing_token"]), {**dict(r), "config": _j(r["config"])}) for r in rows}
 
     # ------------------------------------------------------------ journal
     async def append(self, game_id: str, *, token: int, seq: int, actor: int, task: str, action: Any,
@@ -181,12 +222,39 @@ class Store:
         except IntegrityError as e:
             raise DuplicateStep(f"{game_id}#{seq} (request {request_id})") from e
 
-    async def journal(self, game_id: str) -> list[JournalRow]:
+    async def journal(self, game_id: str, archived: bool = False) -> list[JournalRow]:
+        """The game's steps in order -- from the hot table, or unpacked from game_archive.
+
+        `archived` (the game row's archived_at is set) only says which to try first."""
         async with self.engine.connect() as c:
+            if archived:
+                packed = await c.scalar(text("SELECT journal FROM game_archive WHERE game_id = :g"), {"g": game_id})
+                if packed is not None:
+                    return unpack_journal(_j(packed))
             rows = (await c.execute(text(
                 "SELECT seq, actor, task, action, forced, request_id FROM journal WHERE game_id = :g ORDER BY seq"),
                 {"g": game_id})).all()
-        return [JournalRow(r.seq, r.actor, r.task, _j(r.action), r.forced, r.request_id) for r in rows]
+            if rows:
+                return [JournalRow(r.seq, r.actor, r.task, _j(r.action), r.forced, r.request_id) for r in rows]
+            packed = await c.scalar(text("SELECT journal FROM game_archive WHERE game_id = :g"), {"g": game_id})
+        return unpack_journal(_j(packed)) if packed is not None else []
+
+    async def journals(self, game_ids: list[str]) -> dict[str, list[JournalRow]]:
+        """Many games' journals in two queries (hot, then archive for the rest) instead of one per game."""
+        out: dict[str, list[JournalRow]] = {g: [] for g in game_ids}
+        if not game_ids:
+            return out
+        async with self.engine.connect() as c:
+            for r in (await c.execute(text(
+                    "SELECT game_id, seq, actor, task, action, forced, request_id FROM journal "
+                    "WHERE game_id = ANY(:ids) ORDER BY game_id, seq"), {"ids": list(game_ids)})).all():
+                out[r.game_id].append(JournalRow(r.seq, r.actor, r.task, _j(r.action), r.forced, r.request_id))
+            rest = [g for g, rows in out.items() if not rows]
+            if rest:
+                for r in (await c.execute(text("SELECT game_id, journal FROM game_archive WHERE game_id = ANY(:ids)"),
+                                          {"ids": rest})).all():
+                    out[r.game_id] = unpack_journal(_j(r.journal))
+        return out
 
     async def step_for_request(self, game_id: str, request_id: str) -> JournalRow | None:
         async with self.engine.connect() as c:
@@ -201,7 +269,22 @@ class Store:
             rows = (await c.execute(text(
                 "SELECT DISTINCT ON (seat) seat, belief, note FROM agent_state WHERE game_id = :g "
                 "ORDER BY seat, seq DESC"), {"g": game_id})).all()
+            if not rows:                                   # archived: each seat's last entry was kept
+                mem = await c.scalar(text("SELECT memory FROM game_archive WHERE game_id = :g"), {"g": game_id})
+                return {int(k): (v[0], v[1]) for k, v in (_j(mem) or {}).items()}
         return {int(r.seat): (_j(r.belief), r.note) for r in rows}
+
+    async def agent_memories(self, game_ids: list[str]) -> dict[str, dict[int, tuple[dict, str]]]:
+        """agent_memory() for live games in one query (archived games have none to restore)."""
+        out: dict[str, dict[int, tuple[dict, str]]] = {g: {} for g in game_ids}
+        if not game_ids:
+            return out
+        async with self.engine.connect() as c:
+            for r in (await c.execute(text(
+                    "SELECT DISTINCT ON (game_id, seat) game_id, seat, belief, note FROM agent_state "
+                    "WHERE game_id = ANY(:ids) ORDER BY game_id, seat, seq DESC"), {"ids": list(game_ids)})).all():
+                out[r.game_id][int(r.seat)] = (_j(r.belief), r.note)
+        return out
 
     # ------------------------------------------------------------ model calls
     async def record_calls(self, rows: list[dict]) -> None:
@@ -215,8 +298,14 @@ class Store:
                 [{"game_id": None, "seat": None, "seq": None, "provider": None, "cached_tokens": 0,
                   "cost_usd": 0, "fallback_reason": None, **r} for r in rows])
 
-    async def call_stats(self, game_id: str | None = None) -> dict:
+    async def call_stats(self, game_id: str | None = None, hours: float | None = None) -> dict:
+        """Usage of one game (llm_calls_game_idx), of the last `hours` (llm_calls_time_idx),
+        or of all time. All time is a full scan of llm_calls -- seconds at millions of
+        rows -- so the API asks for a window unless the caller insists (hours=0).
+        """
         where = "WHERE game_id = :g" if game_id else ""
+        if hours and not game_id:
+            where = "WHERE created_at >= now() - make_interval(secs => :h)"
         async with self.engine.connect() as c:
             r = (await c.execute(text(
                 "SELECT count(*) AS calls, coalesce(sum(input_tokens),0) AS input, coalesce(sum(cached_tokens),0) AS cached, "
@@ -224,7 +313,58 @@ class Store:
                 "percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms, "
                 "count(*) FILTER (WHERE status = 'ok' AND fallback_reason IS NOT NULL) AS fallbacks, "
                 f"count(*) FILTER (WHERE status <> 'ok') AS failed FROM llm_calls {where}"),
-                {"g": game_id})).mappings().first()
+                {"g": game_id, "h": float(hours or 0) * 3600})).mappings().first()
         d = dict(r)
         d["cache_hit_rate"] = round(float(d["cached"]) / float(d["input"]), 4) if d["input"] else 0.0
         return d
+
+    # ------------------------------------------------------------ archive
+    async def archive_batch(self, older_than_days: float, batch: int = 500) -> list[str]:
+        """Pack up to `batch` games that ended more than `older_than_days` ago; returns their ids.
+
+        One statement, one transaction: the journal becomes one jsonb array per game in
+        game_archive (TOAST-compressed), model memory shrinks to each seat's last entry,
+        and the hot rows are deleted. The games row stays where it is (lobby, "my games"
+        and the seat FKs keep working) with archived_at set. FOR UPDATE SKIP LOCKED lets
+        two archivers run at once without packing the same game twice.
+        """
+        async with self.engine.begin() as c:
+            rows = (await c.execute(text(ARCHIVE_SQL), {"secs": float(older_than_days) * 86400, "n": batch})).all()
+        return [r[0] for r in rows]
+
+
+# Data-modifying CTEs all read the statement's snapshot, so the INSERT packs the rows
+# the two DELETEs remove, and nothing in between can see a game half-archived.
+ARCHIVE_SQL = """
+WITH pick AS (
+    SELECT id FROM games
+    WHERE archived_at IS NULL AND state IN ('over', 'aborted', 'crashed')
+      AND ended_at < now() - make_interval(secs => :secs)
+    ORDER BY ended_at LIMIT :n
+    FOR UPDATE SKIP LOCKED
+), packed AS (
+    INSERT INTO game_archive (game_id, steps, journal, memory)
+    SELECT p.id,
+           (SELECT count(*) FROM journal j WHERE j.game_id = p.id),
+           jsonb_build_object('v', 1, 'rows', coalesce(
+               (SELECT jsonb_agg(jsonb_build_array(seq, actor, task, action, forced, request_id) ORDER BY seq)
+                FROM journal j WHERE j.game_id = p.id), '[]'::jsonb)),
+           (SELECT jsonb_object_agg(seat, jsonb_build_array(belief, note)) FROM (
+                SELECT DISTINCT ON (seat) seat, belief, note FROM agent_state a
+                WHERE a.game_id = p.id ORDER BY seat, seq DESC) m)
+    FROM pick p
+    RETURNING game_id
+), del_journal AS (
+    DELETE FROM journal WHERE game_id IN (SELECT game_id FROM packed)
+), del_memory AS (
+    DELETE FROM agent_state WHERE game_id IN (SELECT game_id FROM packed)
+)
+UPDATE games SET archived_at = now() WHERE id IN (SELECT game_id FROM packed) RETURNING id
+"""
+
+
+def unpack_journal(packed: dict) -> list[JournalRow]:
+    """game_archive.journal -> rows. v1: {"v": 1, "rows": [[seq, actor, task, action, forced, request_id], ...]}"""
+    if packed.get("v") != 1:
+        raise ValueError(f"unknown archive format {packed.get('v')!r}")
+    return [JournalRow(int(r[0]), int(r[1]), r[2], r[3], bool(r[4]), r[5]) for r in packed["rows"]]
