@@ -16,6 +16,7 @@ Two leaks the old server had are closed here and pinned by tests:
 """
 from __future__ import annotations
 
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ from ...envs import BASELINE_ENGINE_VERSION, ENGINE_VERSION, VARIANTS, Werewolf
 from ...players import GuardStack, LLMPlayer, MockClient, RandomPlayer, RecoveryPolicy, TokenBudget, TransportBudget
 from ...players.human import Pending
 from ...players.providers import profile
+from ...players.providers.recorded import RecordingClient, recorder_for
 from ...server.service import _client as _provider_client
 
 # Tasks whose actor and (thought-free) action the whole table sees.
@@ -66,6 +68,9 @@ class TableConfig:
     # code is deployed (envs/werewolf.py, docs/adr/0010). None = the current version,
     # resolved by Table; a stored config without the key predates versioning.
     engine_version: int | None = None
+    # Keep every model call of this game (request + reply/error) in a cassette under
+    # LLM_RECORD_DIR (players/providers/recorded.py). LLM_RECORD=1 turns it on for all games.
+    record: bool = False
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -171,6 +176,11 @@ class Table:
                                      max_game_tokens=self.cfg.max_tokens, fallbacks=self.cfg.fallbacks)
         else:
             client = (client_factory or self.client_for)(model, seat)
+        writer = self.cassette()
+        if writer is not None:
+            # One player object per turn here, so its own turn counter is always 0: the
+            # journal version it was asked at goes in front of it in the key.
+            client = RecordingClient(client, writer, seat=seat, turn_prefix="-" if version is None else version)
         # Behind the gateway, fallbacks and backoff already happened once per call;
         # retrying the whole chain again at the seat only multiplies the wait.
         pol = RecoveryPolicy(timeout_s=profile(model)["timeout_s"],
@@ -179,6 +189,20 @@ class Table:
         return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
                          token_budget=self.tokens, playbook=self.cfg.playbook != "none",
                          on_step=on_step, lang=self.cfg.lang)
+
+    def cassette(self):
+        """This game's cassette writer, or None when the game is not being recorded.
+
+        A file per game, appended to by whichever process runs the turn (the actor's
+        node, a Streams worker, the node that adopted the game after a crash): one line
+        per call, so lines from several processes interleave but never tear. The writer
+        is cached per process so the message blobs are written once per process.
+        """
+        if not (self.cfg.record or os.environ.get("LLM_RECORD") == "1"):
+            return None
+        path = os.path.join(os.environ.get("LLM_RECORD_DIR", "runs/cassettes"), f"{self.id}.cassette.jsonl")
+        return recorder_for(path, {"game_id": self.id, "seed": self.seed, "config": self.cfg.to_dict(),
+                                   "online": True})
 
     def client_for(self, model: str, seat: int):
         if model == "mock":

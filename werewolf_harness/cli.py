@@ -3,6 +3,8 @@
     python -m werewolf_harness.cli play   --variant 12p --seed 8 --model mock
     python -m werewolf_harness.cli play   --variant 12p --seed 8 --model <gateway model> --guard L1,L2,L3 --out game.json
     python -m werewolf_harness.cli replay game.json          # rebuild the world from the journal, compare outcomes
+    python -m werewolf_harness.cli play ... --record --out g.json   # also keep every model call (g.cassette.jsonl)
+    python -m werewolf_harness.cli replay-llm g.json         # re-run the agents on the recorded replies, no model
     python -m werewolf_harness.cli random --variant 12p --seeds 20   # scripted seats, no model: exercises the rules
 
 Models other than "mock" need LLM_API_KEY (and LLM_BASE_URL for a relay).
@@ -24,6 +26,13 @@ from .players import (BudgetExhausted, GatewayExhausted, GuardStack, LLMPlayer, 
 def _client(model: str, seed: int):
     if model == "mock":
         return MockClient(seed=seed)
+    if model.startswith("mock-slow"):              # mock-slow:300 -> a mock that takes 300 ms a call
+        ms = int(model.split(":", 1)[1]) if ":" in model else 300
+        return MockClient(seed=seed, sleep_ms=ms, latency_ms=ms)
+    if model.startswith("mock-chaos"):             # mock-chaos[:error_rate[:malformed_rate]] -- only a recording replays it
+        from .players.providers.mock import ChaosMockClient
+        rates = [float(x) for x in model.split(":")[1:3]]
+        return ChaosMockClient(seed=seed, **dict(zip(("error_rate", "malformed_rate"), rates)))
     from .players.providers.claude_cli import ClaudeCLIClient, is_cli_model
     if is_cli_model(model):
         return ClaudeCLIClient(model)
@@ -32,16 +41,32 @@ def _client(model: str, seed: int):
     return OpenAICompatClient(model, api_key=key, base_url=base, tool_mode=os.getenv("LLM_TOOL_MODE", "native"))
 
 
+def play_settings(a: argparse.Namespace) -> dict:
+    """What shapes the seats' prompts, saved in the log so `replay-llm` can rebuild them."""
+    return {"guard": a.guard, "evidence": a.evidence, "playbook": a.playbook, "temperature": a.temperature,
+            "lang": a.lang, "max_tokens": a.max_tokens, "max_usd": a.max_usd, "parallel": a.parallel}
+
+
 def cmd_play(a: argparse.Namespace) -> int:
+    from .replay_llm import build_players
     env = Werewolf(a.variant, playbook_mode=a.playbook, engine_version=a.engine_version)
     n = VARIANTS[a.variant].num_players
-    guard = GuardStack(tuple(x for x in a.guard.split(",") if x), evidence_forced=a.evidence)
-    budget = TransportBudget()
-    tokens = TokenBudget(max_tokens=a.max_tokens, max_usd=a.max_usd)
-    players = {s: LLMPlayer(_client(a.model, a.seed * 100 + s), guard=guard, transport_budget=budget,
-                            token_budget=tokens, playbook=a.playbook != "none",
-                            temperature=a.temperature, lang=a.lang, async_note=a.parallel > 1)
-               for s in range(1, n + 1)}
+    settings = play_settings(a)
+    cassette = None
+    if a.record:
+        if not a.out:
+            print("!! --record 要配 --out：录像写在日志旁边", file=sys.stderr)
+            return 4
+        from .players.providers.recorded import CassetteWriter, RecordingClient, cassette_path_for
+        cassette = CassetteWriter(cassette_path_for(a.out), meta={"variant": a.variant, "seed": a.seed,
+                                                                  "model": a.model, "settings": settings,
+                                                                  "started": time.time()})
+
+    def client_for(s: int):
+        c = _client(a.model, a.seed * 100 + s)
+        return RecordingClient(c, cassette, seat=s) if cassette is not None else c
+
+    players, tokens, guard = build_players(settings, n, client_for)
     t0 = time.time()
     crashed = None
     try:
@@ -54,6 +79,11 @@ def cmd_play(a: argparse.Namespace) -> int:
         crashed = str(exc)
         print(f"!! 预算用尽：{exc}", file=sys.stderr)
         return 3
+    finally:
+        if cassette is not None:
+            cassette.close()
+            # a game that died still leaves its calls: the cassette is the record of how
+            print(f"   录像：{cassette.calls} 次模型调用 -> {cassette.path}")
     dur = time.time() - t0
     truth = env.ground_truth()
     print(f"== {a.variant} seed={a.seed} model={a.model} guard={guard.label()} engine=v{env.engine_version} -> {ep.outcome['winner']} in round {ep.outcome['round']} "
@@ -77,10 +107,43 @@ def cmd_play(a: argparse.Namespace) -> int:
             "turns": [t.to_dict() for p in players.values() for t in p.history],
             "night": env.night_records(), "pack_chat": env.pack_chat_log(),
             "parallel": a.parallel, "timings": ep.timings, "misses": ep.misses,
+            "settings": settings,
         }
+        if cassette is not None:
+            log["cassette"] = os.path.basename(cassette.path)
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, "w") as f:
             json.dump(log, f, ensure_ascii=False, indent=1, default=str)
         print(f"   wrote {a.out}")
+    return 0
+
+
+def cmd_replay_llm(a: argparse.Namespace) -> int:
+    """Re-run a recorded game through the real LLMPlayer stack; the replies come from the cassette."""
+    from .replay_llm import compare, load, replay_game
+    try:
+        log, cas = load(a.file, a.cassette)
+    except FileNotFoundError as exc:
+        print(f"!! {exc}", file=sys.stderr)
+        return 2
+    rep = replay_game(log, cas, allow_drift=a.allow_drift, upto=a.upto)
+    diffs = compare(log, rep, upto=a.upto)
+    if a.strict and not diffs and a.upto is None and len(rep.used) != rep.recorded:
+        unused = [k for k in cas.order if k not in rep.used][:5]
+        diffs.append(f"录像里有 {rep.recorded - len(rep.used)} 次调用回放时没用到，例如 {unused}")
+    orig = log.get("duration_s")
+    print(f"== replay-llm {a.file}: 从录像答了 {rep.calls} 次调用（录像共 {rep.recorded} 次），"
+          f"真实模型调用 0 次，用时 {rep.ms:.0f} ms" + (f"（录制这局用了 {orig:.1f} s）" if orig else ""))
+    for d in rep.drifts[:10]:
+        print(f"   提示词变了 @ {d.key}\n      " + d.diff.replace("\n", "\n      "))
+    if len(rep.drifts) > 10:
+        print(f"   …… 一共 {len(rep.drifts)} 处提示词变化")
+    if diffs:
+        for d in diffs:
+            print("   DIVERGED: " + d)
+        return 1
+    what = f"前 {a.upto} 步 journal" if a.upto is not None else "journal、结局、每个回合的信念和笔记"
+    print(f"   {what}一致 ✓" + (f"（{len(rep.drifts)} 处提示词变化，录下的回复仍然适用）" if rep.drifts else ""))
     return 0
 
 
@@ -220,6 +283,15 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"用哪一版规则（默认当前 v{ENGINE_VERSION}）；旧版规则只为对照实验和回放保留")
     pl.add_argument("--parallel", type=int, default=8,
                     help="最多几个座位同时想（投票、复盘、夜里互不依赖的角色）；1 = 一个一个来")
+    pl.add_argument("--record", action="store_true",
+                    help="录下每一次模型调用（请求+回复/错误），写在 --out 旁边的 .cassette.jsonl")
+    rl = sub.add_parser("replay-llm", help="用录像重跑一局：真实的 LLMPlayer，模型换成录像，核对 journal")
+    rl.add_argument("file")
+    rl.add_argument("--cassette", default=None, help="录像路径（默认看日志里的 cassette 字段或日志旁边）")
+    rl.add_argument("--strict", action="store_true", help="另外要求录像里每一次调用都被用到")
+    rl.add_argument("--allow-drift", action="store_true", dest="allow_drift",
+                    help="提示词变了也继续：报告哪里变了，只要录下的回复还适用就接着跑")
+    rl.add_argument("--upto", type=int, default=None, help="只回放前 N 步")
     rp = sub.add_parser("replay")
     rp.add_argument("file")
     rp.add_argument("--upto", type=int, default=None)
@@ -242,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("--model", default=None, help="只探这一个模型")
     pv.add_argument("--timeout", type=float, default=60.0)
     a = p.parse_args(argv)
-    return {"play": cmd_play, "replay": cmd_replay, "random": cmd_random,
+    return {"play": cmd_play, "replay": cmd_replay, "replay-llm": cmd_replay_llm, "random": cmd_random,
             "serve": cmd_serve, "serve-legacy": cmd_serve_legacy, "providers": cmd_providers, "resume": cmd_resume}[a.cmd](a)
 
 

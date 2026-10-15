@@ -96,6 +96,20 @@ for it). Every seat -- random script, `LLMPlayer`, a browser later -- implements
 `act`. The journal `[(actor, task, action)]` rebuilds the world exactly (G4);
 `cli replay` proves it on any saved game.
 
+The agents are reproducible too, once their model calls are kept: `play --record`
+writes every request and reply (or error) to `g.cassette.jsonl` next to the log, and
+`replay-llm g.json` re-runs the real LLMPlayer stack on those replies (0 model calls,
+~100 ms a game) and checks journal, outcome, beliefs and notes; a changed prompt is
+reported with the seat/turn/call and a diff. `scripts/make_regression.py` turns a
+recording into a case under `tests/regressions/` (ADR 0008):
+
+```
+CLAUDE_CLI_CONCURRENCY=8 python -m werewolf_harness.cli play --variant 8p --seed 1001 \
+    --model claude-cli:haiku --parallel 8 --record --out runs/rec/g1001.json
+python -m werewolf_harness.cli replay-llm runs/rec/g1001.json
+python -m werewolf_harness.scripts.make_regression runs/rec/g1001.json --name g1001 --upto 40
+```
+
 ## The game (envs/werewolf.py)
 
 - Seats 1..N, roles dealt from `Variant.role_counts` with `random.Random(seed)`; that and the
