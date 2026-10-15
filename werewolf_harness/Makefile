@@ -2,7 +2,7 @@
 PY ?= ../.venv/bin/python
 ROOT := $(abspath ..)
 
-.PHONY: dev run worker test test-core lint migrate bench chaos load up down
+.PHONY: dev run worker test test-core lint migrate bench chaos load up down compat compat-db
 
 dev:            ## Postgres + Redis + Jaeger in Docker
 	docker compose -f deploy/docker-compose.dev.yml up -d
@@ -16,6 +16,11 @@ test:           ## everything (integration tests need make dev)
 	cd $(ROOT) && $(PY) -m pytest werewolf_harness/tests -q
 test-core:      ## no database needed
 	cd $(ROOT) && $(PY) -m pytest werewolf_harness/tests -q --ignore=werewolf_harness/tests/integration
+compat:         ## every stored journal replays under its recorded engine version (CI gate); real logs vs current rules
+	cd $(ROOT) && $(PY) -m pytest werewolf_harness/tests/test_engine_compat.py -q
+	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.compat_check 'werewolf_harness/tests/corpus/*.json' --fingerprint
+compat-db:      ## the same check over every game in Postgres (DATABASE_URL) -- run before deploying a new engine version
+	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.compat_check --db --fingerprint
 lint:
 	ruff check app tests/integration scripts loadtest
 bench:

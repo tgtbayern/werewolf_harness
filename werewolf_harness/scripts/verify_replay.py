@@ -14,7 +14,6 @@ import json
 
 from ..app.config import get_settings
 from ..app.runtime.runtime import Runtime
-from ..app.runtime.table import Table, TableConfig
 from ..app.storage import Store
 from ..arena import Record, Terminal
 
@@ -24,8 +23,8 @@ async def verify(store: Store, limit: int = 500) -> dict:
     bad = []
     for g in games:
         rows = await store.journal(g["id"])
-        t = Table(g["id"], g["seed"], TableConfig.from_dict(g["config"]))
         try:
+            t = Runtime.table_from_row(g)                 # the engine version the game was created with
             Runtime.replay(t, [Record(r.actor, r.task, r.action, r.forced) for r in rows])
             ok = isinstance(t.turn, Terminal) and json.loads(json.dumps(t.turn.outcome, default=str)) == \
                 json.loads(json.dumps(g["outcome"], default=str))

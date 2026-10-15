@@ -10,13 +10,14 @@ SEATS12 = {1: "werewolf", 2: "werewolf", 3: "werewolf", 4: "werewolf", 5: "seer"
            7: "hunter", 8: "guard", 9: "villager", 10: "villager", 11: "villager", 12: "villager"}
 
 
-def table(roles: dict[int, str] | None = None, variant: str = "12p", playbook: str = "none", seed: int = 1, **variant_overrides):
+def table(roles: dict[int, str] | None = None, variant: str = "12p", playbook: str = "none", seed: int = 1,
+          engine_version: int | None = None, **variant_overrides):
     """A fresh environment whose deal is `roles` (tests may fix the deal; players never can)."""
     from ..envs.werewolf import VARIANTS, Variant
     v = VARIANTS[variant]
     if variant_overrides:
         v = Variant(**{**v.__dict__, **variant_overrides})
-    env = Werewolf(v, playbook_mode=playbook)
+    env = Werewolf(v, playbook_mode=playbook, engine_version=engine_version)
     env.reset(seed)
     if roles is not None:
         assert sorted(roles) == list(range(1, v.num_players + 1))

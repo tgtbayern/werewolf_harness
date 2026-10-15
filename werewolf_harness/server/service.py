@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..arena import ActionSpec, Record, StepLedger, Terminal, Turn
-from ..envs import VARIANTS, Werewolf
+from ..envs import VARIANTS, Werewolf, engine_version_of
 from ..players import (BudgetExhausted, GatewayExhausted, GuardStack, HumanPlayer, LLMPlayer,
                        MockClient, OpenAICompatClient, RandomPlayer, RecoveryPolicy, TokenBudget,
                        TransportBudget)
@@ -115,7 +115,7 @@ class Game:
 
     def __init__(self, *, variant: str, model: str | list[str], guard: str, playbook: str,
                  human_seats: list[int], turn_seconds: float | None, seed: int,
-                 max_tokens: int, env_keys: dict, xray: bool = False):
+                 max_tokens: int, env_keys: dict, xray: bool = False, engine_version: int | None = None):
         self.id = f"g{next(_ids)}"
         models = [model] if isinstance(model, str) else list(model)
         self.models = models or ["mock"]
@@ -138,7 +138,7 @@ class Game:
         self.state = "waiting" if self.human_seats else "running"
         self.error: str | None = None
 
-        self.env = Werewolf(variant, playbook_mode=playbook)
+        self.env = Werewolf(variant, playbook_mode=playbook, engine_version=engine_version)   # ADR 0010
         self.lock = threading.RLock()
         self.ledger = StepLedger(game=self.id)
         self.journal: list[Record] = []
@@ -385,6 +385,7 @@ class Game:
                 "outcome": self.outcome, "error": self.error,
                 "xray": self.xray, "acting": self._acting_now(),
                 "resumed_from": self.resumed_from, "saved_to": self.saved_to,
+                "engine_version": self.env.engine_version,
                 "health": self.health(), "created": round(self.created, 3)}
 
     def seat_state(self, seat: int | None) -> dict:
@@ -516,7 +517,7 @@ class GameService:
                     guard=g.get("guard", "L1+L2+L3"), playbook=g.get("playbook", "static"),
                     human_seats=list(g.get("human_seats") or []), turn_seconds=None,
                     seed=int(g["seed"]), max_tokens=max_tokens or DEFAULT_RESUME_TOKENS,
-                    env_keys=self.env_keys, xray=bool(g.get("xray")))
+                    env_keys=self.env_keys, xray=bool(g.get("xray")), engine_version=engine_version_of(g))
         game.resumed_from = g.get("id", "存档")
         game.replay_into(records)
         self.games[game.id] = game
@@ -542,7 +543,7 @@ class GameService:
                  playbook=old.playbook, human_seats=list(old.human_seats),
                  turn_seconds=old.turn_seconds, seed=old.seed,
                  max_tokens=max_tokens or old.tokens.max_tokens * 3,
-                 env_keys=self.env_keys, xray=old.xray)
+                 env_keys=self.env_keys, xray=old.xray, engine_version=old.env.engine_version)
         g.resumed_from = gid
         g.replay_into(old.journal)
         self.games[g.id] = g

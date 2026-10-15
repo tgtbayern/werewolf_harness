@@ -16,7 +16,7 @@ import sys
 import time
 
 from .arena import Record, Terminal, replay, run
-from .envs import VARIANTS, Werewolf
+from .envs import ENGINE_VERSION, VARIANTS, VIEW_REVISION, Werewolf, engine_version_of
 from .players import (BudgetExhausted, GatewayExhausted, GuardStack, LLMPlayer, MockClient,
                       OpenAICompatClient, RandomPlayer, TokenBudget, TransportBudget)
 
@@ -33,7 +33,7 @@ def _client(model: str, seed: int):
 
 
 def cmd_play(a: argparse.Namespace) -> int:
-    env = Werewolf(a.variant, playbook_mode=a.playbook)
+    env = Werewolf(a.variant, playbook_mode=a.playbook, engine_version=a.engine_version)
     n = VARIANTS[a.variant].num_players
     guard = GuardStack(tuple(x for x in a.guard.split(",") if x), evidence_forced=a.evidence)
     budget = TransportBudget()
@@ -56,7 +56,7 @@ def cmd_play(a: argparse.Namespace) -> int:
         return 3
     dur = time.time() - t0
     truth = env.ground_truth()
-    print(f"== {a.variant} seed={a.seed} model={a.model} guard={guard.label()} -> {ep.outcome['winner']} in round {ep.outcome['round']} "
+    print(f"== {a.variant} seed={a.seed} model={a.model} guard={guard.label()} engine=v{env.engine_version} -> {ep.outcome['winner']} in round {ep.outcome['round']} "
           f"({len(ep.journal)} turns, {dur:.0f}s, parallel={a.parallel}"
           + (f", {ep.misses} answers asked too early and thrown away" if ep.misses else "") + ")")
     h = ep.health
@@ -68,6 +68,8 @@ def cmd_play(a: argparse.Namespace) -> int:
           + (f"；网关自报是本地口径的 {tokens.drift()}×" if tokens.drift() else ""))
     if a.out:
         log = {
+            # the rules this journal was written under: replay must use the same ones
+            "engine_version": env.engine_version, "view_revision": VIEW_REVISION,
             "variant": a.variant, "seed": a.seed, "model": a.model, "guard": guard.label(), "playbook": a.playbook,
             "outcome": ep.outcome, "ground_truth": truth, "duration_s": dur, "crashed": crashed,
             "health": ep.health.to_dict(), "usage": tokens.to_dict(),
@@ -84,14 +86,15 @@ def cmd_play(a: argparse.Namespace) -> int:
 
 def cmd_replay(a: argparse.Namespace) -> int:
     log = json.load(open(a.file))
-    env = Werewolf(log["variant"], playbook_mode=log.get("playbook", "static"))
+    # a log from before versioning has no engine_version: it was played under the baseline rules
+    env = Werewolf(log["variant"], playbook_mode=log.get("playbook", "static"), engine_version=engine_version_of(log))
     journal = [Record(**r) for r in log["journal"]]
     end = replay(env, log["seed"], journal, upto=a.upto if a.upto is not None else None)
     if a.upto is not None:
         print(f"after {a.upto} steps -> next turn {end}")
         return 0
     same = isinstance(end, Terminal) and json.loads(json.dumps(end.outcome)) == log["outcome"]   # JSON turns int keys into str
-    print("replay:", "identical ✓" if same else f"DIVERGED: {end}")
+    print(f"replay (engine v{env.engine_version}):", "identical ✓" if same else f"DIVERGED: {end}")
     return 0 if same else 1
 
 
@@ -213,6 +216,8 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--max-usd", type=float, default=None, dest="max_usd")
     pl.add_argument("--out", default=None)
     pl.add_argument("--lang", default="zh", choices=["zh", "en"], help="AI 发言用的语言")
+    pl.add_argument("--engine-version", type=int, default=None, dest="engine_version",
+                    help=f"用哪一版规则（默认当前 v{ENGINE_VERSION}）；旧版规则只为对照实验和回放保留")
     pl.add_argument("--parallel", type=int, default=8,
                     help="最多几个座位同时想（投票、复盘、夜里互不依赖的角色）；1 = 一个一个来")
     rp = sub.add_parser("replay")
