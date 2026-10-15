@@ -40,6 +40,81 @@ ROLE_ORDER = ("werewolf", "seer", "witch", "hunter", "guard", "villager")
 _PLURAL = {"werewolf": "werewolves", "witch": "witches"}
 
 
+# ---------------------------------------------------------------- engine versions
+#
+# world = f(seed, journal) holds only for a fixed ``step``. The version names that
+# function: a game is created under one version and is replayed under that same
+# version forever (crash recovery, audit, the review page), whatever code is deployed.
+#
+# What counts. ENGINE_VERSION moves when, for some (seed, journal), the world after
+# replay could differ: the deal in ``reset``, what ``step`` does, who ``_next`` asks,
+# and which actions ``action_space`` makes LEGAL (``step`` refuses an illegal one, so
+# legality is step behaviour). It does NOT move for what a seat is SHOWN -- ``observe``,
+# tool descriptions, ``rules_text``, ``open_turns``. Views are not in the journal; they
+# are recomputed from the world on every read, so an old game recovered under new view
+# code is the same world, rendered the new way. The precedent is VIEW_REVISION 2
+# (sealed ballots, review rounds written at once): it changed what a voter sees while
+# the vote runs and which turns the driver may ask early, and every journal written
+# before it still replays step for step -- so it was a view revision, not an engine one.
+# VIEW_REVISION is recorded beside the engine version for provenance (it explains
+# why the same journal produced different model behaviour) but never selects code.
+#
+# How. A step-relevant change is one entry in RULE_CHANGES: a flag and the version that
+# introduced it. ``Rules.at(v)`` turns a version into flags, and the engine branches on
+# the flag (``if self.rules.tie_revote:``), never on a version number and never by
+# copying the engine. Retiring a version (raising MIN_ENGINE_VERSION) is what lets a
+# branch be deleted; see docs/adr/0010-engine-versions.md for the support window.
+
+@dataclass(frozen=True)
+class RuleChange:
+    flag: str             # the attribute on Rules the engine branches on
+    introduced: int       # first engine version with the new behaviour
+    summary: str
+
+
+RULE_CHANGES: tuple[RuleChange, ...] = (
+    RuleChange("tie_revote", 2,
+               "平票 PK: a tied day vote is re-run once between the tied players (they do not "
+               "vote); a second tie exiles nobody. Before v2 a tie exiled nobody at once."),
+)
+
+BASELINE_ENGINE_VERSION = 1      # the rules every unversioned journal was written under
+MIN_ENGINE_VERSION = 1           # the oldest version this code can still replay
+ENGINE_VERSION = max([BASELINE_ENGINE_VERSION] + [c.introduced for c in RULE_CHANGES])
+VIEW_REVISION = 2                # informational: see above
+
+
+class UnsupportedEngineVersion(ValueError):
+    """A game recorded under a version this code cannot reproduce: too old (its
+    branches were retired) or too new (written by a newer node -- a rolling deploy)."""
+
+
+@dataclass(frozen=True)
+class Rules:
+    """The step-relevant rule set of one engine version, as flags."""
+    version: int
+    tie_revote: bool = False
+
+    @classmethod
+    def at(cls, version: int) -> Rules:
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise UnsupportedEngineVersion(f"engine version must be an int, got {version!r}")
+        if version < MIN_ENGINE_VERSION or version > ENGINE_VERSION:
+            raise UnsupportedEngineVersion(
+                f"engine v{version} is outside what this code replays (v{MIN_ENGINE_VERSION}..v{ENGINE_VERSION})")
+        return cls(version, **{c.flag: version >= c.introduced for c in RULE_CHANGES})
+
+    def changed_since(self, older: int) -> list[RuleChange]:
+        """The rule changes between ``older`` and this version: what a diverging replay can blame."""
+        return [c for c in RULE_CHANGES if older < c.introduced <= self.version]
+
+
+def engine_version_of(record: dict | None) -> int:
+    """The version a stored game was made with; a game from before versioning is the baseline."""
+    v = (record or {}).get("engine_version")
+    return BASELINE_ENGINE_VERSION if v is None else int(v)
+
+
 @dataclass(frozen=True)
 class Variant:
     name: str
@@ -64,7 +139,7 @@ class Variant:
     guard_witch_overlap_kills: bool = False   # 同守同救: True = they cancel and the player dies
     witch_self_save: bool = False      # the witch may use the antidote on herself
     hunter_shoots_on: frozenset = frozenset({"werewolf", "vote", "witch", "hunter"})
-    tie_policy: str = "nobody"         # "nobody" only, for now
+    # what a tied day vote does is an engine rule, not a variant knob: see Rules.tie_revote
 
     @property
     def num_players(self) -> int:
@@ -146,11 +221,16 @@ class Death:
 class Werewolf:
     """Seats are 1..N. Tasks are the keys of TASK_TERMINALS."""
 
-    def __init__(self, variant: str | Variant = "12p", playbook_mode: str = "static"):
+    def __init__(self, variant: str | Variant = "12p", playbook_mode: str = "static",
+                 engine_version: int | None = None):
+        """``engine_version`` selects the rules a game was created under (None = the
+        current ones). A replay must pass the version the game recorded."""
         self.variant = VARIANTS[variant] if isinstance(variant, str) else variant
         if playbook_mode not in ("none", "static", "dynamic"):
             raise ValueError(f"unknown playbook mode: {playbook_mode!r}")
         self.playbook_mode = playbook_mode
+        self.rules = Rules.at(ENGINE_VERSION if engine_version is None else engine_version)
+        self.engine_version = self.rules.version
         self._playbook = load_playbook()
 
     # ================================================================ reset
@@ -178,6 +258,9 @@ class Werewolf:
         self._speeches: list[Speech] = []
         self._votes: dict[int, dict[int, int | None]] = {}
         self._exiles: dict[int, int | None] = {}
+        # 平票 PK (rules.tie_revote): the first ballot of a tied day, and who stands in the revote
+        self._tie_ballots: dict[int, dict[int, int | None]] = {}
+        self._revote: list[int] = []         # non-empty while a revote is running
         self._action_log: dict[int, list[dict]] = {s: [] for s in seats}
 
         # night
@@ -282,6 +365,9 @@ class Werewolf:
             "speakers_total": len(order),
             "private": {"my_actions": list(self._action_log[actor][-14:])},
         }
+        if self.rules.tie_revote:              # only under the rule, so older games' views do not move
+            v["public"]["tie_votes"] = {r: dict(b) for r, b in self._tie_ballots.items()}
+            v["public"]["revote_candidates"] = list(self._revote)
         priv = v["private"]
         if role == "werewolf":
             priv["fellow_wolves"] = [s for s in self._team("werewolf") if s in self._alive and s != actor]
@@ -448,6 +534,10 @@ class Werewolf:
             return ToolSpec(name, "At night: do nothing this night. ENDS YOUR TURN.", {"thought": self.THOUGHT})
         if name == "speak":
             return ToolSpec(name, "Say something to the table. ENDS YOUR TURN.", {"content": text("what you say out loud"), "thought": self.THOUGHT})
+        if name == "vote" and self._revote:
+            return ToolSpec(name, "平票 PK revote: choose which of the tied players is exiled. ENDS YOUR TURN.",
+                            {"target_id": Param("int", "one of the tied players", choices=tuple(self._revote)),
+                             "thought": self.THOUGHT})
         if name == "vote":
             return ToolSpec(name, "Cast your vote to exile a player. ENDS YOUR TURN.",
                             {"target_id": Param("int", "a living player, not yourself", choices=tuple(others)),
@@ -996,6 +1086,9 @@ class Werewolf:
             leaders = [t for t, n in weighted.items() if n == top]
             if len(leaders) == 1:
                 exiled = leaders[0]
+            elif self.rules.tie_revote and not self._revote and self._begin_revote(sorted(leaders)):
+                return
+        self._revote = []
         self._exiles[self._round] = exiled
         if exiled is not None:
             self._kill(exiled, "vote")
@@ -1006,7 +1099,22 @@ class Werewolf:
         else:
             self._close_day()
 
+    def _begin_revote(self, tied: list[int]) -> bool:
+        """平票 PK (rules.tie_revote, engine v2): the day's vote runs once more, between the
+        tied players only, and they do not vote in it. The first ballot is kept as a public
+        record. False when nobody is left to vote (every living player is tied): the
+        tie then stands and exiles nobody, as before v2."""
+        voters = [s for s in sorted(self._alive) if s not in tied]
+        if not voters:
+            return False
+        self._tie_ballots[self._round] = dict(self._votes[self._round])
+        self._votes[self._round] = {}
+        self._revote = list(tied)
+        self._day_voters = voters
+        return True
+
     def _apply_detonate(self, actor: int, reason: str) -> None:
+        self._revote = []
         self._kill(actor, "detonate")
         self._detonations.append({"round": self._round, "player_id": actor, "reason": reason})
         self._log(actor, "self_detonate", reason=reason[:120])
@@ -1172,7 +1280,8 @@ class Werewolf:
         if counts.get("witch"):
             lines.append("The witch may use her antidote on herself." if v.witch_self_save else self.RULES["witch_self"])
         lines += [
-            "Each day every living player speaks once, in a fixed order, and then everyone votes at the same time: nobody sees a ballot until all are cast. The player with the most votes is exiled; a tie exiles nobody.",
+            "Each day every living player speaks once, in a fixed order, and then everyone votes at the same time: nobody sees a ballot until all are cast. The player with the most votes is exiled; "
+            + (self.RULES["tie_revote"] if self.rules.tie_revote else "a tie exiles nobody."),
             "",
             "Night actions are decided by the players who hold them: the seer chooses who to check, each wolf names a kill and the pack's majority stands, and the witch chooses whether to spend her antidote or her poison.",
         ]
@@ -1207,6 +1316,7 @@ class Werewolf:
         "guard_witch_overlap": "A player the guard protects and the witch saves on the same night survives; the two do not cancel each other out.",
         "guard_witch_overlap_kills": "A player the guard protects and the witch saves on the same night dies; the two cancel each other out.",
         "witch_self": "The witch may not use her antidote on herself.",
+        "tie_revote": "on a tie the vote is held once more between the tied players only (they do not vote in it), and a second tie exiles nobody.",
         "hunter_any_death": "The hunter may shoot whenever he dies -- exiled, killed by the wolves, or poisoned by the witch. Nothing silences the shot.",
     }
 
@@ -1233,6 +1343,46 @@ class Werewolf:
 
     def review_log(self) -> list[dict]:
         return [dict(e) for e in getattr(self, '_review_chat', [])]
+
+    def public_state(self) -> dict:
+        """The public record of the world -- what the whole table knows happened -- for
+        comparing two replays step by step (scripts/compat_check.py).
+
+        Deliberately not a view: ballots are listed as cast even while sealed (sealing
+        is a view rule, the ballots are world facts), and the rules text is left out --
+        both differ between engine versions without the world differing. Keys a newer
+        rule adds appear only once that rule has acted, so two versions agree until a
+        rule actually fires.
+        """
+        out: dict[str, Any] = {
+            "round": self._round, "phase": self._phase, "alive": sorted(self._alive),
+            "dead": [[d.round, d.player_id, self._public_cause(d.cause)] for d in self._deaths],
+            "speeches": [[s.round, s.player_id, s.kind, s.content] for s in self._speeches],
+            "votes": {r: dict(b) for r, b in self._votes.items()},
+            "exiles": dict(self._exiles), "sheriff": self._sheriff, "candidates": list(self._candidates),
+            "badge": list(self._badge_transfers), "shots": list(self._shots),
+            "detonations": [[d["round"], d["player_id"]] for d in self._detonations],
+            "review": [dict(e) for e in self._review_chat], "winner": self._winner,
+        }
+        if self._tie_ballots or self._revote:
+            out["tie_votes"] = {r: dict(b) for r, b in self._tie_ballots.items()}
+            out["revote"] = list(self._revote)
+        return out
+
+    def world_state(self) -> dict:
+        """Every private field of the world, normalised to JSON-able values: what
+        ``step`` reads and writes. Two replays that agree here are the same world."""
+        def norm(x):
+            if isinstance(x, (set, frozenset)):
+                return sorted(x)
+            if isinstance(x, dict):
+                return {str(k): norm(v) for k, v in x.items()}
+            if isinstance(x, (list, tuple)):
+                return [norm(v) for v in x]
+            if hasattr(x, "__dataclass_fields__"):
+                return norm(dict(x.__dict__))
+            return x
+        return {k: norm(v) for k, v in sorted(vars(self).items()) if k.startswith("_") and k != "_playbook"}
 
     def outcome(self) -> dict | None:
         """The frozen result, or None while the game is still live."""

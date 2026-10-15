@@ -24,6 +24,7 @@ from typing import Any
 from redis.asyncio import Redis
 
 from ...arena import Record
+from ...envs import UnsupportedEngineVersion, engine_version_of
 from ...players.providers import retired
 from ..config import Settings
 from ..obs import logging as olog
@@ -55,6 +56,7 @@ class Runtime:
         self.draining = False
         self._tasks: list[asyncio.Task] = []
         self._adopting: set[str] = set()
+        self.incompatible: dict[str, str] = {}      # live games whose engine version this code cannot replay
         self.counters = {"adopted": 0, "lost_leases": 0, "created": 0}
         self.listeners: list[Callable[[str, dict], Any]] = []
 
@@ -101,7 +103,8 @@ class Runtime:
         seed = seed if seed is not None else int.from_bytes(secrets.token_bytes(2), "big")
         table = Table(gid, seed, cfg, self.env_keys, hub=self.hub)
         await self.store.create_game(game_id=gid, variant=cfg.variant, seed=seed, config=cfg.to_dict(),
-                                     state=table.state, seats=table.seat_rows(), created_by=created_by)
+                                     state=table.state, seats=table.seat_rows(), created_by=created_by,
+                                     engine_version=table.engine_version)
         if not await self.leases.acquire(gid):
             raise RuntimeError("could not take the lease on a brand-new game")
         token = await self.store.bump_fencing(gid, self.node)
@@ -128,13 +131,15 @@ class Runtime:
         cfg = TableConfig(variant=g.get("variant", "12p"), models=list(g.get("models") or ["mock"]),
                           guard=g.get("guard", "L1+L2+L3"), playbook=g.get("playbook", "static"),
                           human_seats=list(g.get("human_seats") or []), turn_seconds=None,
-                          max_tokens=max_tokens or 6_000_000, xray=bool(g.get("xray")))
+                          max_tokens=max_tokens or 6_000_000, xray=bool(g.get("xray")),
+                          # the save's own rules; a save from before versioning played the baseline
+                          engine_version=engine_version_of(g))
         gid = "g" + secrets.token_hex(4)
         table = Table(gid, int(g["seed"]), cfg, self.env_keys, hub=self.hub)
         self.replay(table, records)                       # validate before writing anything
         await self.store.create_game(game_id=gid, variant=cfg.variant, seed=table.seed, config=cfg.to_dict(),
                                      state="running", seats=table.seat_rows(), created_by=created_by,
-                                     resumed_from=g.get("id", "存档"))
+                                     resumed_from=g.get("id", "存档"), engine_version=table.engine_version)
         if not await self.leases.acquire(gid):
             raise RuntimeError("could not take the lease on a brand-new game")
         token = await self.store.bump_fencing(gid, self.node)
@@ -162,8 +167,7 @@ class Runtime:
         row = await self.store.get_game(gid)
         if row is None:
             return None
-        table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
-                      created=row["created_at"].timestamp())
+        table = self.table_from_row(row, self.env_keys)
         table.state = row["state"]
         rows = await self.store.journal(gid)
         self.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows])
@@ -198,8 +202,15 @@ class Runtime:
             if row is None or row["state"] not in ("waiting", "running"):
                 await self.leases.release(gid)
                 return None
-            table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys,
-                          created=row["created_at"].timestamp(), hub=self.hub)
+            try:
+                table = self.table_from_row(row, self.env_keys, hub=self.hub)
+            except UnsupportedEngineVersion as exc:
+                # Written by a newer node (rolling deploy) or under retired rules: replaying it
+                # here would rebuild a different world. Leave it for a node that can.
+                await self.leases.release(gid)
+                self.incompatible[gid] = str(exc)
+                olog.kv(log, 30, "cannot adopt: engine version", game_id=gid, error=str(exc))
+                return None
             table.state = row["state"]
             table.resumed_from = row.get("resumed_from")
             rows = await self.store.journal(gid)
@@ -221,6 +232,19 @@ class Runtime:
             self._adopting.discard(gid)
 
     @staticmethod
+    def table_from_row(row: dict, env_keys: dict | None = None, hub=None) -> Table:
+        """A Table for a stored game, under the rules it was created with.
+
+        The ``engine_version`` column decides (a row from before the column defaults to
+        the baseline); the config copy is overwritten with it so the two cannot disagree.
+        Raises UnsupportedEngineVersion when this code cannot reproduce that version.
+        """
+        cfg = TableConfig.from_dict(row["config"])
+        cfg.engine_version = engine_version_of(row)
+        created = row.get("created_at")
+        return Table(row["id"], row["seed"], cfg, env_keys, created=created.timestamp() if created else None, hub=hub)
+
+    @staticmethod
     def replay(table: Table, journal: list[Record], request_ids: dict | None = None) -> None:
         """Rebuild world and events from the journal. No model is asked anything."""
         table.reset()
@@ -239,7 +263,7 @@ class Runtime:
     async def scan(self) -> int:
         n = 0
         for g in await self.store.live_games():
-            if g["id"] in self.actors:
+            if g["id"] in self.actors or g["id"] in self.incompatible:
                 continue
             if await self.leases.holder(g["id"]) is None and await self.adopt(g["id"]):
                 n += 1

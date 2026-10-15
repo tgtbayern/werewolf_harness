@@ -42,7 +42,6 @@ from ..config import Settings
 from ..obs import logging as olog
 from ..obs import metrics, tracing
 from ..runtime.agents import AgentJob, AgentResult, run_agent_turn
-from ..runtime.table import Table, TableConfig
 
 LANES = ("human", "online", "offline")
 GROUP = "workers"
@@ -209,8 +208,8 @@ class Worker:
         # A job may have been asked ahead of its turn (an open vote), so the world may have
         # moved since `version`. It is still wanted if the seat's turn is still open now; the
         # actor checks at commit time that the seat sees what it saw when it was asked.
-        table = Table(gid, row["seed"], TableConfig.from_dict(row["config"]), self.env_keys, hub=self.hub)
         from ..runtime.runtime import Runtime
+        table = Runtime.table_from_row(row, self.env_keys, hub=self.hub)      # under the game's own engine version
         Runtime.replay(table, [Record(r.actor, r.task, r.action, r.forced) for r in rows])
         t = table.turn
         opener = getattr(table.env, "open_turns", None)

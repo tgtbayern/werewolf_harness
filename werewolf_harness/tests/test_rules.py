@@ -215,18 +215,48 @@ def test_badge_passes_on_any_death_including_a_shot():
     assert env._death_cause(V1) == "hunter"
 
 
-def test_tie_exiles_nobody():
-    env, turn, script = _to_day()
+def _tied_day(engine_version):
+    """Day one, everyone's ballot scripted so that W1 and V2 tie 5-5 (their own ballots go elsewhere)."""
+    env, turn, script = _night({}, engine_version=engine_version)
     alive = sorted(env._alive)
     half = len(alive) // 2
     for s in alive[:half]:
         script.moves[(s, "vote")] = {"name": "vote", "args": {"target_id": W1 if s != W1 else W2}}
     for s in alive[half:]:
         script.moves[(s, "vote")] = {"name": "vote", "args": {"target_id": V2 if s != V2 else V3}}
+    return env, turn, script
+
+
+def test_tie_exiles_nobody_under_engine_v1():
+    env, turn, script = _tied_day(engine_version=1)
     play_until(env, turn, lambda e, t: e._round == 2, script)
     assert env._exiles[1] is None
     assert len(env._alive) == 12
     assert "a tie exiles nobody" in env.rules_text()
+    assert "tie_votes" not in env.observe(V1)["public"]          # v1 views do not grow the v2 keys
+
+
+def test_tie_is_revoted_once_between_the_tied_under_engine_v2():
+    env, turn, script = _tied_day(engine_version=2)
+    turn = play_until(env, turn, lambda e, t: bool(e._revote), script)
+    assert env._revote == [W1, V2] and turn.task == "vote"
+    assert W1 not in env._day_voters and V2 not in env._day_voters and len(env._day_voters) == 10
+    assert choices(env, turn.actor, "vote", "vote") == [W1, V2]
+    first = env.observe(V1)["public"]["tie_votes"][1]
+    assert first[W2] == W1 and first[V1] == V2 and len(first) == 12                  # the first ballot stays on the record
+    # the same split again -> a second tie, which exiles nobody
+    play_until(env, turn, lambda e, t: e._round == 2, script)
+    assert env._exiles[1] is None and len(env._alive) == 12 and env._revote == []
+    assert "held once more between the tied players" in env.rules_text()
+
+
+def test_a_revote_can_exile_one_of_the_tied():
+    env, turn, script = _tied_day(engine_version=2)
+    turn = play_until(env, turn, lambda e, t: bool(e._revote), script)
+    for s in env._day_voters:
+        script.moves[(s, "vote")] = {"name": "vote", "args": {"target_id": W1}}
+    play_until(env, turn, lambda e, t: e._round == 2 or t.task == "last_words", script)
+    assert env._exiles[1] == W1 and W1 not in env._alive
 
 
 def test_vote_has_no_abstention_and_excludes_self():

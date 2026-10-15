@@ -48,6 +48,7 @@ python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku
 | 先写库再生效 | journal 与模型记忆同一事务；主键 `(game_id, seq)` 保证一步只写一次；`request_id` 防重复提交 | ADR 0002 |
 | 崩溃恢复 | 重放 journal，并从 `agent_state` 恢复模型座位的信念表和笔记；已提交的回合不重新问模型 | `runtime.py`、`scripts/chaos_demo.py` |
 | 多节点 | Redis 租约 + Postgres fencing token；被暂停后醒来的旧节点无法写入 | ADR 0004 |
+| 引擎版本 | 每局记录创建时的规则版本（`games.engine_version`），恢复和重放按记录的版本；规则改动挂在版本开关上；`compat_check` 列出一次规则变更会影响的老局和分叉步，CI 回放 74 份存档 journal | ADR 0010、`make compat` |
 | 回合计时 | 分层时间轮（O(1) 挂 / 撤） | `app/runtime/timers.py` |
 | 模型调用层 | 回退链、熔断器、按 token 的令牌桶（Redis + Lua）、每局预算、逐次记账、按任务路由模型；模型可以是各家 API，也可以是本机 `claude -p` | `app/llm/gateway.py`、`players/providers/claude_cli.py` |
 | 模型任务队列 | Redis Streams：三条优先级流、至少一次投递、XAUTOCLAIM 认领、死信 | ADR 0005 |

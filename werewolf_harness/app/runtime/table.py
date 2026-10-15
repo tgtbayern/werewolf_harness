@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...arena import Record, StepLedger, Terminal, Turn
-from ...envs import VARIANTS, Werewolf
+from ...envs import BASELINE_ENGINE_VERSION, ENGINE_VERSION, VARIANTS, Werewolf
 from ...players import GuardStack, LLMPlayer, MockClient, RandomPlayer, RecoveryPolicy, TokenBudget, TransportBudget
 from ...players.human import Pending
 from ...players.providers import profile
@@ -61,6 +61,11 @@ class TableConfig:
     # Experiments abandon a game whose models keep failing (a sample the harness played
     # is not a sample). A table with people at it keeps going on rule seats instead.
     abort_on_outage: bool = False
+    # The rules the game is played under, fixed when it is created and never changed:
+    # recovery and every later replay rebuild the world with this version, whatever
+    # code is deployed (envs/werewolf.py, docs/adr/0010). None = the current version,
+    # resolved by Table; a stored config without the key predates versioning.
+    engine_version: int | None = None
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -68,6 +73,7 @@ class TableConfig:
     @classmethod
     def from_dict(cls, d: dict) -> TableConfig:
         known = {k: d[k] for k in cls.__dataclass_fields__ if k in d}
+        known.setdefault("engine_version", BASELINE_ENGINE_VERSION)
         return cls(**known)
 
 
@@ -95,7 +101,10 @@ class Table:
         self.human_seats = [s for s in cfg.human_seats if 1 <= s <= self.n]
         self.models = list(cfg.models) or ["mock"]
         self.model_label = self.models[0] if len(self.models) == 1 else "混合"
-        self.env = Werewolf(cfg.variant, playbook_mode=cfg.playbook)
+        if cfg.engine_version is None:
+            cfg.engine_version = ENGINE_VERSION          # pinned here, so the stored config carries it
+        self.env = Werewolf(cfg.variant, playbook_mode=cfg.playbook, engine_version=cfg.engine_version)
+        self.engine_version = self.env.engine_version
         self.ledger = StepLedger(game=game_id)
         self.journal: list[Record] = []
         self.request_ids: dict[str, int] = {}       # client retry key -> seq
@@ -228,7 +237,7 @@ class Table:
     def _snap(self) -> dict:
         e = self.env
         return {"dead": {d.player_id for d in e._deaths}, "round": e._round, "phase": e._phase,
-                "exiles": dict(e._exiles), "sheriff": e._sheriff}
+                "exiles": dict(e._exiles), "sheriff": e._sheriff, "revote": list(getattr(e, "_revote", []))}
 
     def _news(self, before: dict) -> list[str]:
         e = self.env
@@ -244,6 +253,9 @@ class Table:
                     counts[t] = counts.get(t, 0) + 1
                 tally = "、".join(f"{t} 号 {n} 票" for t, n in sorted(counts.items(), key=lambda x: -x[1])) or "无人投票"
                 out.append(f"第 {r} 轮票型：{tally} → " + (f"{ex} 号出局。" if ex is not None else "平票，无人出局。"))
+        revote = list(getattr(e, "_revote", []))
+        if revote and revote != before["revote"]:
+            out.append(f"第 {e._round} 轮平票：" + "、".join(f"{t} 号" for t in revote) + " PK，其余玩家再投一次。")
         if before["phase"] != e._phase and e._phase == "day_speech" and not fresh:
             out.append(f"第 {e._round} 天天亮：平安夜，没有人死。")
         if before["phase"] != e._phase and e._phase == "review":
@@ -303,7 +315,8 @@ class Table:
                 "alive": alive, "round": rnd, "phase": phase, "reviewing": phase == "review",
                 "outcome": self.outcome, "error": self.error, "xray": self.cfg.xray,
                 "acting": self.acting_view(seat), "resumed_from": self.resumed_from,
-                "health": self.health(), "created": round(self.created, 3), "version": len(self.journal)}
+                "health": self.health(), "created": round(self.created, 3), "version": len(self.journal),
+                "engine_version": self.engine_version}
 
     def spectator_view(self) -> dict:
         v = dict(self.env.observe(1))
