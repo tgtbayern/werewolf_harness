@@ -17,13 +17,9 @@ tests/                      核心 + integration（需要 Postgres / Redis）
 
 ## 快速开始
 
-> 这两个文件因为写入权限，放在了非标准的位置，需要手动挪一下：
-> - `tasks.mk` → 改名为 `Makefile`（或者直接用 `make -f tasks.mk dev`）
-> - `deploy/github-ci.yml` → 挪到仓库根目录的 `.github/workflows/ci.yml`
-
 ```
-# 依赖（在上一级目录建 venv；包名是 werewolf_harness）
-uv venv ../.venv && uv pip install -p ../.venv -r pyproject.toml --extra dev
+# 依赖（在上一级目录建 venv；包名是 werewolf_harness）。锁文件带哈希，CI 用的是同一份
+uv venv ../.venv && uv pip install -p ../.venv --require-hashes -r requirements-dev.lock
 make dev          # Docker 起 Postgres + Redis + Jaeger
 make run          # http://127.0.0.1:8402  （首次启动会自动迁移数据库）
 make test         # 全部测试；make test-core 不需要数据库
@@ -68,8 +64,10 @@ make chaos        # 两个节点，kill -9 其中一个，看另一个接管（�
 make bench        # 接管耗时、空闲资源占用、优先级排队、故障演练、缓存命中
 make load         # WebSocket 压测（先 make run）
 python -m werewolf_harness.scripts.verify_replay   # 已结束的局逐一重放，检查结局一致
-docker compose -f deploy/docker-compose.yml up -d --build   # 整套：双节点 + worker + Caddy + 监控
+make up / make smoke / make down   # Docker 整套：双节点 + worker + Caddy + 监控；smoke 打一局 mock 并逐项检查
 ```
+
+容器部署、CI 和验证记录见 `docs/deploy.md`。注意 `claude-cli` 座位只能在宿主机上跑（`cli serve`），容器里只有 mock / sim / API key 模型。
 
 旧的单进程服务还在：`python -m werewolf_harness.cli serve-legacy`（标准库 HTTP，无持久化）。
 

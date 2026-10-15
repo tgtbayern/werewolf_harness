@@ -18,6 +18,18 @@ from .helpers import until
 from .test_api import _clean, _guest
 
 
+def record_launches(rt: Runtime) -> list:
+    """The tables rt starts, in order. A mock game can finish and leave rt.actors before a
+    poll sees it there, so the order (and the table) is taken at launch instead."""
+    launched, launch = [], rt._launch
+
+    async def recording(table):
+        launched.append(table)
+        return await launch(table)
+    rt._launch = recording
+    return launched
+
+
 class LoadDial(LocalExecutor):
     """A real executor whose reported load is set by the test."""
 
@@ -74,14 +86,17 @@ async def test_overloaded_node_queues_then_starts_fifo_when_load_drops(settings,
     lv = rt.load_view()
     assert lv["overloaded"] and lv["admission"]["queued_games"] == 3 and lv["level"] == "overloaded"
 
+    launched = record_launches(rt)
     ex.heavy = False                                        # the provider recovers
-    await until(lambda: all(g in rt.actors for g in queued), 20)
-    order = [g for g in rt.actors if g in queued]
-    assert order == queued                                  # first come, first started
+    await until(lambda: len(launched) == len(queued), 20)
+    assert [t.id for t in launched] == queued               # first come, first started
     assert rt.admission.waits and len(rt.admission) == 0
-    for g in queued:
-        await until(lambda g=g: len(rt.actors[g].t.journal) > 0, 20)
-        assert (await store.get_game(g))["state"] == "running"
+    for g in queued:                                        # each one really plays (it may be over already)
+        for _ in range(1000):
+            if await store.journal(g):
+                break
+            await asyncio.sleep(0.02)
+        assert await store.journal(g) and (await store.get_game(g))["state"] in ("running", "over")
     await rt.shutdown()
 
 
@@ -97,10 +112,12 @@ async def test_queued_games_survive_a_restart_in_order(settings, store, redis):
     ex2 = LoadDial()
     ex2.heavy = True
     rt2 = Runtime(s, store, redis, executor=ex2)
+    launched = record_launches(rt2)
     await rt2.start(scan=True)                              # recovery must not adopt a queued game
     assert [rt2.admission.position(g) for g in ids] == [1, 2] and not rt2.actors
     ex2.heavy = False
-    await until(lambda: all(g in rt2.actors for g in ids), 20)
+    await until(lambda: len(launched) == 2, 20)
+    assert [t.id for t in launched] == ids
     await rt2.shutdown()
 
 
@@ -120,9 +137,11 @@ async def test_a_queued_game_keeps_its_engine_version_across_a_restart(settings,
     await rt.shutdown()
     ex2 = LoadDial()
     rt2 = Runtime(s, store, redis, executor=ex2)
+    launched = record_launches(rt2)
     await rt2.start(scan=True)
-    await until(lambda: gid in rt2.actors, 20)
-    assert rt2.actors[gid].t.engine_version == BASELINE_ENGINE_VERSION
+    await until(lambda: len(launched) == 1, 20)
+    assert launched[0].id == gid and launched[0].engine_version == BASELINE_ENGINE_VERSION
+    assert launched[0].env.rules.tie_revote is False
     await rt2.shutdown()
 
 
