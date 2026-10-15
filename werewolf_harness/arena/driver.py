@@ -236,12 +236,22 @@ def _flush(players: dict) -> None:
 
 
 def _elicit(player: Player, view: dict, task: str, spec: ActionSpec, max_retries: int) -> tuple[Any, bool]:
+    """Ask until the action is legal; (action, forced).
+
+    forced is True when the driver fell back to spec.fallback, and also when the player
+    itself reports that the legal action it returned was its own fallback
+    (``last_forced``: an LLM seat whose model never produced a usable answer, a human
+    who timed out). Without the second half the health line counted 0 forced turns
+    while the seats were filling in moves the model never chose. Read right after
+    act(), on the same thread, so the parallel path (which calls this per seat on the
+    pool) sees the flag of this turn and not another one's.
+    """
     feedback = None
     for _ in range(max_retries):
         action = player.act(view, task, spec, feedback)
         reason = spec.check(action)
         if reason is None:
-            return action, False
+            return action, bool(getattr(player, "last_forced", False))
         feedback = reason                      # the reason goes back to the actor
     return spec.fallback, True
 

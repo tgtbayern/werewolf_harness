@@ -342,3 +342,28 @@ def test_an_info_tool_is_not_given_an_argument_it_does_not_take():
     from ..players.llm import build_registry
     for t in build_registry(True).visible("villager"):
         assert "thought" not in t.spec.params
+
+
+class Mumbler(LLMClient):
+    """Never produces a usable answer: every turn ends on the seat's own fallback."""
+    name = "mumbler"
+    tool_mode = "native"
+
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0):
+        return LLMResponse(text="hmm...")
+
+
+@pytest.mark.parametrize("parallel", [1, 4])
+def test_a_seat_reported_fallback_is_journalled_as_forced(parallel):
+    """The seat returns a *legal* action (its fallback), so the driver's own check passes;
+    the journal and the health line must still count it as forced, on both paths."""
+    from ..players import RandomPlayer
+    players = {s: RandomPlayer(900 + s) for s in range(1, 9)}
+    players[3] = LLMPlayer(Mumbler(), policy=RecoveryPolicy(max_retries=1), async_note=parallel > 1)
+    ep = run(Werewolf("8p"), players, 9, parallel=parallel)
+    players[3].flush()
+    fell_back = sum(1 for t in players[3].history if t.fallback_used)
+    seat3 = [r for r in ep.journal if r.actor == 3]
+    assert fell_back > 0 and fell_back == len(seat3) == sum(r.forced for r in seat3)
+    assert not any(r.forced for r in ep.journal if r.actor != 3)
+    assert ep.health.forced == fell_back
