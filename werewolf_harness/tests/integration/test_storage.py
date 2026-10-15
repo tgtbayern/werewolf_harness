@@ -88,12 +88,18 @@ async def test_live_games_and_user_games_use_their_indexes(store):
     await _game(store)
     async with store.engine.begin() as c:
         await c.execute(text("SET LOCAL enable_seqscan = off"))
+        await c.execute(text("SET LOCAL enable_bitmapscan = off"))
         plan = "\n".join(r[0] for r in (await c.execute(text(
             "EXPLAIN SELECT id FROM games WHERE state IN ('waiting','running') ORDER BY created_at"))).all())
         assert "games_live_idx" in plan
+        # "my games" reads the newest seats straight off the index: no sort node (j1)
         plan = "\n".join(r[0] for r in (await c.execute(text(
-            "EXPLAIN SELECT game_id FROM game_seats WHERE user_id = 'u_x'"))).all())
-        assert "game_seats_user_idx" in plan
+            "EXPLAIN SELECT game_id FROM game_seats WHERE user_id = 'u_x' "
+            "ORDER BY game_created_at DESC NULLS LAST, game_id DESC LIMIT 20"))).all())
+        assert "game_seats_user_time_idx" in plan and "Sort" not in plan
+        plan = "\n".join(r[0] for r in (await c.execute(text(
+            "EXPLAIN SELECT id FROM games ORDER BY created_at DESC, id DESC LIMIT 50"))).all())
+        assert "games_created_idx" in plan and "Sort" not in plan
 
 
 async def test_call_stats(store):

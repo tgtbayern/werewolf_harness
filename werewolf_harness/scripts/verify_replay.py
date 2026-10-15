@@ -18,11 +18,17 @@ from ..app.storage import Store
 from ..arena import Record, Terminal
 
 
-async def verify(store: Store, limit: int = 500) -> dict:
-    games = [g for g in await store.recent_games(limit) if g["state"] == "over"]
+async def verify(store: Store, limit: int = 500, chunk: int = 100) -> dict:
+    """The newest `limit` finished games (picked in SQL -- filtering a page of recent
+    games in Python checked fewer than asked once live games crowded the top), with
+    their journals fetched `chunk` games per query (archived ones unpacked)."""
+    games = await store.finished_games(limit)
+    journals: dict = {}
+    for i in range(0, len(games), chunk):
+        journals.update(await store.journals([g["id"] for g in games[i:i + chunk]]))
     bad = []
     for g in games:
-        rows = await store.journal(g["id"])
+        rows = journals[g["id"]]
         try:
             t = Runtime.table_from_row(g)                 # the engine version the game was created with
             Runtime.replay(t, [Record(r.actor, r.task, r.action, r.forced) for r in rows])

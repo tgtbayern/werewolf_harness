@@ -112,3 +112,23 @@ async def test_a_node_on_older_code_does_not_adopt_a_newer_game(settings, store,
     await up_rt.start(scan=True)
     assert g.id in up_rt.actors and up_rt.actors[g.id].t.engine_version == 2
     await up_rt.shutdown()
+
+
+async def test_batched_adoption_rebuilds_each_game_under_its_own_version(settings, store, redis):
+    """scan() adopts orphans `recovery_batch` at a time from one claim_live UPDATE: the row
+    it returns must carry engine_version, or every game in the batch would come back as v1."""
+    s = settings.model_copy(update={"recovery_batch": 4})
+    a_rt = _rt(s, store, redis, "node-a", executor=GatedExecutor())       # frozen: games stay live
+    await a_rt.start(scan=False)
+    made = {}
+    for i, v in enumerate((1, 2, 1, 2, 2)):
+        g = await a_rt.create(TableConfig(variant="8p", models=["mock"], engine_version=v), seed=50 + i)
+        made[g.id] = v
+    await a_rt.shutdown(drain=True)
+
+    b_rt = _rt(s, store, redis, "node-b", executor=GatedExecutor())
+    await b_rt.start(scan=False)
+    assert await b_rt.scan() == len(made)
+    assert {gid: b_rt.actors[gid].t.engine_version for gid in made} == made
+    assert all(b_rt.actors[gid].t.env.rules.tie_revote is (v == 2) for gid, v in made.items())
+    await b_rt.shutdown()

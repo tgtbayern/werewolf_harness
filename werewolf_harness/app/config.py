@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     lease_ttl_ms: int = 10_000          # a node that stops renewing loses the game after this
     lease_renew_s: float = 3.0
     recovery_scan_s: float = 5.0        # how often a node looks for games nobody holds
+    recovery_batch: int = 50            # orphaned games adopted per round trip during a scan
     agent_timeout_s: float = 240.0      # a model turn that takes longer is replaced by the fallback
     human_turn_s: float = 300.0
 
