@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Str
 from redis.asyncio import Redis
 
 from ...envs import VARIANTS
+from ...players.llm.cascade import CascadePolicy
 from ...players.providers import PROFILES, offered
 from ...server.http import read_env
 from ..auth import tokens
@@ -81,7 +82,8 @@ def build_runtime(settings: Settings, store: Store, redis: Redis, env_keys: dict
     return rt
 
 
-LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky", "mock-stream", "sim-stream"]
+LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky", "mock-stream", "sim-stream",
+                "mock-strong", "mock-flaky"]
 
 
 def _playable(env_keys: dict) -> list[str]:
@@ -317,6 +319,15 @@ def _routes(app: FastAPI) -> None:
         # A seat whose model has no key (or whose CLI is missing) would be played by the
         # rule fallback for the whole game -- refuse it here instead of 40 turns later.
         playable = set(_playable(request.app.state.env_keys))
+        cascade = body.get("cascade") or None          # {"cheap", "strong", "mode", ...}: docs/adr/0014
+        if cascade is not None:
+            if not isinstance(cascade, dict) or not cascade.get("cheap") or not cascade.get("strong"):
+                raise HTTPException(400, "cascade 要写明 cheap 和 strong 两个模型")
+            try:
+                CascadePolicy.from_mode(cascade.get("mode", "both"), decisive=cascade.get("decisive"))
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+            models = models + [cascade["cheap"], cascade["strong"]]
         unusable = [m for m in dict.fromkeys(models + list(body.get("fallbacks") or [])) if m not in playable]
         if unusable:
             raise HTTPException(400, f"这些模型现在用不了（没有 key，或本机找不到 claude）：{', '.join(unusable)}")
@@ -326,6 +337,7 @@ def _routes(app: FastAPI) -> None:
                           turn_seconds=None if body.get("turn_seconds") in (None, 0, "0") else float(body["turn_seconds"]),
                           max_tokens=int(body.get("max_tokens") or DEFAULT_MAX_TOKENS), xray=bool(body.get("xray")),
                           fallbacks=list(body.get("fallbacks") or []), routing=body.get("routing") or None,
+                          cascade=cascade,
                           lane=body.get("lane"), lang=body.get("lang") if body.get("lang") in ("zh", "en") else "zh")
         try:
             decision, a, queued = await s.rt.request(cfg, seed=int(body.get("seed") or 0) or None, created_by=user["id"])

@@ -26,7 +26,9 @@ from ...arena import Record, StepLedger, Terminal, Turn
 from ...envs import BASELINE_ENGINE_VERSION, ENGINE_VERSION, VARIANTS, Werewolf
 from ...players import GuardStack, LLMPlayer, MockClient, RandomPlayer, RecoveryPolicy, TokenBudget, TransportBudget
 from ...players.human import Pending
+from ...players.llm.cascade import CascadePolicy
 from ...players.providers import profile
+from ...players.providers.mock import cascade_mock
 from ...players.providers.recorded import RecordingClient, recorder_for
 from ...server.service import _client as _provider_client
 
@@ -56,6 +58,12 @@ class TableConfig:
     fallbacks: list[str] = field(default_factory=list)
     # route by task instead of by seat: {"strong": m1, "cheap": m2, "strong_tasks": [...]}
     routing: dict | None = None
+    # Model cascade (players/llm/cascade.py, docs/adr/0014): every AI seat answers on the cheap
+    # model and moves to the strong one inside a turn when the cheap reply fails validation
+    # and/or on decisive turns. {"cheap": m1, "strong": m2, "mode": "on-fail"|"decisive"|"both",
+    # "decisive": [...] (optional), "low_confidence": bool (optional)}. Supersedes `routing`
+    # (which is `mode="decisive"` without the in-turn retry); a stored routing config still works.
+    cascade: dict | None = None
     lane: str | None = None           # queue lane override (e.g. "offline" for batch experiments)
     lang: str = "zh"                  # what the AI seats speak: "zh" (简体中文) or "en"
     # ask every open model turn at once (votes, the review, independent night roles)
@@ -190,6 +198,17 @@ class Table:
             self.seat_models = {s: "route" for s in ai}
             self.models = [cfg.routing["strong"], cfg.routing["cheap"]]
             self.model_label = f"路由 {cfg.routing['strong']}/{cfg.routing['cheap']}"
+        self.cascade_policy = None
+        if cfg.cascade:
+            self.cascade_policy = CascadePolicy.from_mode(cfg.cascade.get("mode", "both"),
+                                                          decisive=cfg.cascade.get("decisive"),
+                                                          low_confidence=bool(cfg.cascade.get("low_confidence")))
+        if self.cascade_policy is not None:
+            self.seat_models = {s: "cascade" for s in ai}
+            self.models = [cfg.cascade["cheap"], cfg.cascade["strong"]]
+            self.model_label = f"级联 {cfg.cascade['cheap']}→{cfg.cascade['strong']}（{self.cascade_policy.mode}）"
+        # per game: turns each tier answered, escalations by reason (from AgentResult.meta)
+        self.cascade_stats: dict = {"turns": 0, "strong_turns": 0, "calls": 0, "strong_calls": 0, "escalations": {}}
 
         guards = tuple(x for x in cfg.guard.split("+") if x and x != "无")
         self.guard = GuardStack(guards)
@@ -212,6 +231,8 @@ class Table:
         if m == "route" and self.cfg.routing:
             strong = self.cfg.routing.get("strong_tasks") or self.STRONG_TASKS
             return self.cfg.routing["strong"] if task in strong else self.cfg.routing["cheap"]
+        if m == "cascade" and self.cfg.cascade:
+            return self.cfg.cascade["cheap"]           # the tier a turn starts on; the loop may escalate
         return m
 
     def make_player(self, seat: int, client_factory=None, on_step=None, task: str | None = None,
@@ -221,6 +242,24 @@ class Table:
         model = self.model_for(seat, task)
         if model == "script":
             return RandomPlayer(self.seed * 100 + seat)
+        client = self._seat_client(model, seat, version, client_factory)
+        timeout = profile(model)["timeout_s"]
+        tiers: dict = {}
+        if self.seat_models.get(seat) == "cascade" and self.cascade_policy is not None:
+            strong = self.cfg.cascade["strong"]
+            tiers = {"strong_client": self._seat_client(strong, seat, version, client_factory, tier="strong"),
+                     "cascade": self.cascade_policy}
+            timeout = max(timeout, profile(strong)["timeout_s"])   # one policy serves both tiers
+        # Behind the gateway, fallbacks and backoff already happened once per call;
+        # retrying the whole chain again at the seat only multiplies the wait.
+        pol = RecoveryPolicy(timeout_s=timeout,
+                             max_transport_retries=0 if self.hub is not None else RecoveryPolicy.max_transport_retries)
+        budget = self.transport if (self.cfg.abort_on_outage or self.hub is None) else None
+        return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
+                         token_budget=self.tokens, playbook=self.cfg.playbook != "none",
+                         on_step=on_step, lang=self.cfg.lang, **tiers)
+
+    def _seat_client(self, model: str, seat: int, version: int | None, client_factory=None, tier: str | None = None):
         if client_factory is None and self.hub is not None:
             client = self.hub.client(model, self.seed * 100 + seat, game_id=self.id, seat=seat, seq=version,
                                      max_game_tokens=self.cfg.max_tokens, fallbacks=self.cfg.fallbacks)
@@ -229,16 +268,24 @@ class Table:
         writer = self.cassette()
         if writer is not None:
             # One player object per turn here, so its own turn counter is always 0: the
-            # journal version it was asked at goes in front of it in the key.
-            client = RecordingClient(client, writer, seat=seat, turn_prefix="-" if version is None else version)
-        # Behind the gateway, fallbacks and backoff already happened once per call;
-        # retrying the whole chain again at the seat only multiplies the wait.
-        pol = RecoveryPolicy(timeout_s=profile(model)["timeout_s"],
-                             max_transport_retries=0 if self.hub is not None else RecoveryPolicy.max_transport_retries)
-        budget = self.transport if (self.cfg.abort_on_outage or self.hub is None) else None
-        return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
-                         token_budget=self.tokens, playbook=self.cfg.playbook != "none",
-                         on_step=on_step, lang=self.cfg.lang)
+            # journal version it was asked at goes in front of it in the key. A cascade's
+            # strong tier shares that numbering (recorded.RecordingClient, `tier`).
+            client = RecordingClient(client, writer, seat=seat, turn_prefix="-" if version is None else version,
+                                     tier=tier)
+        return client
+
+    def note_cascade(self, meta: dict) -> None:
+        """Count one committed model turn's cascade record (AgentResult.meta["cascade"])."""
+        c = meta.get("cascade")
+        if not c:
+            return
+        st = self.cascade_stats
+        st["turns"] += 1
+        st["strong_turns"] += int(c.get("tier") == "strong")
+        st["calls"] += len(c.get("calls") or [])
+        st["strong_calls"] += sum(1 for x in c.get("calls") or [] if x.get("tier") == "strong")
+        for e in c.get("escalations") or []:
+            st["escalations"][e["reason"]] = st["escalations"].get(e["reason"], 0) + 1
 
     def cassette(self):
         """This game's cassette writer, or None when the game is not being recorded.
@@ -257,6 +304,9 @@ class Table:
     def client_for(self, model: str, seat: int):
         if model == "mock":
             return MockClient(seed=self.seed * 100 + seat)
+        offline = cascade_mock(model, self.seed * 100 + seat)     # the cascade's offline tiers
+        if offline is not None:
+            return offline
         return _provider_client(model, self.seed * 100 + seat, self.env_keys)
 
     # ------------------------------------------------------------ world
@@ -510,7 +560,10 @@ class Table:
                 "outcome": self.outcome, "error": self.error, "xray": self.cfg.xray,
                 "acting": self.acting_view(seat), "resumed_from": self.resumed_from,
                 "health": self.health(), "created": round(self.created, 3), "version": len(self.journal),
-                "engine_version": self.engine_version}
+                "engine_version": self.engine_version,
+                # whole-game counts only: which seat escalated on which turn is not public
+                **({"cascade": dict(self.cascade_stats, mode=self.cascade_policy.mode)}
+                   if self.cascade_policy is not None else {})}
 
     def spectator_view(self) -> dict:
         v = dict(self.env.observe(1))

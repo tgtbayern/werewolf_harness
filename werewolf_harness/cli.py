@@ -6,6 +6,8 @@
     python -m werewolf_harness.cli play ... --record --out g.json   # also keep every model call (g.cassette.jsonl)
     python -m werewolf_harness.cli replay-llm g.json         # re-run the agents on the recorded replies, no model
     python -m werewolf_harness.cli random --variant 12p --seeds 20   # scripted seats, no model: exercises the rules
+    python -m werewolf_harness.cli play --model claude-cli:haiku --strong claude-cli:sonnet --cascade both ...
+                                         # model cascade: cheap by default, strong on failure / decisive turns
 
 Models other than "mock" need LLM_API_KEY (and LLM_BASE_URL for a relay).
 """
@@ -26,6 +28,10 @@ from .players import (BudgetExhausted, GatewayExhausted, GuardStack, LLMPlayer, 
 def _client(model: str, seed: int):
     if model == "mock":
         return MockClient(seed=seed)
+    from .players.providers.mock import cascade_mock
+    offline = cascade_mock(model, seed)            # mock-strong, mock-flaky[:bad_rate]: a cascade's offline tiers
+    if offline is not None:
+        return offline
     if model.startswith("mock-slow"):              # mock-slow:300 -> a mock that takes 300 ms a call
         ms = int(model.split(":", 1)[1]) if ":" in model else 300
         return MockClient(seed=seed, sleep_ms=ms, latency_ms=ms)
@@ -43,8 +49,23 @@ def _client(model: str, seed: int):
 
 def play_settings(a: argparse.Namespace) -> dict:
     """What shapes the seats' prompts, saved in the log so `replay-llm` can rebuild them."""
-    return {"guard": a.guard, "evidence": a.evidence, "playbook": a.playbook, "temperature": a.temperature,
-            "lang": a.lang, "max_tokens": a.max_tokens, "max_usd": a.max_usd, "parallel": a.parallel}
+    s = {"guard": a.guard, "evidence": a.evidence, "playbook": a.playbook, "temperature": a.temperature,
+         "lang": a.lang, "max_tokens": a.max_tokens, "max_usd": a.max_usd, "parallel": a.parallel}
+    policy = cascade_policy(a)
+    if policy is not None:
+        # only when on: a log played without a cascade keeps exactly the settings it always had
+        s.update({"cascade": policy.to_dict(), "cascade_mode": policy.mode, "strong": a.strong})
+    return s
+
+
+def cascade_policy(a: argparse.Namespace):
+    """--cascade MODE [--decisive t1,t2] [--low-confidence] -> CascadePolicy, or None."""
+    from .players.llm.cascade import CascadePolicy
+    mode = getattr(a, "cascade", "off") or "off"
+    if mode != "off" and not getattr(a, "strong", None):
+        raise SystemExit("!! --cascade 需要 --strong <强模型>")
+    decisive = [x for x in a.decisive.split(",") if x] if getattr(a, "decisive", None) else None
+    return CascadePolicy.from_mode(mode, decisive=decisive, low_confidence=getattr(a, "low_confidence", False))
 
 
 def cmd_play(a: argparse.Namespace) -> int:
@@ -59,14 +80,16 @@ def cmd_play(a: argparse.Namespace) -> int:
             return 4
         from .players.providers.recorded import CassetteWriter, RecordingClient, cassette_path_for
         cassette = CassetteWriter(cassette_path_for(a.out), meta={"variant": a.variant, "seed": a.seed,
-                                                                  "model": a.model, "settings": settings,
+                                                                  "model": a.model, "strong": settings.get("strong"),
+                                                                  "settings": settings,
                                                                   "started": time.time()})
 
-    def client_for(s: int):
-        c = _client(a.model, a.seed * 100 + s)
-        return RecordingClient(c, cassette, seat=s) if cassette is not None else c
+    def client_for(s: int, model: str = a.model, tier: str | None = None):
+        c = _client(model, a.seed * 100 + s)
+        return RecordingClient(c, cassette, seat=s, tier=tier) if cassette is not None else c
 
-    players, tokens, guard = build_players(settings, n, client_for)
+    players, tokens, guard = build_players(settings, n, client_for,
+                                           strong_for=lambda s: client_for(s, a.strong, "strong"))
     t0 = time.time()
     crashed = None
     try:
@@ -96,6 +119,11 @@ def cmd_play(a: argparse.Namespace) -> int:
     print(f"   用量：本地估算 {tokens.total_tokens} tokens / 上限 {tokens.max_tokens}"
           + (f"，约 ${tokens.usd:.2f}" if any(tokens.price_per_1m) else "")
           + (f"；网关自报是本地口径的 {tokens.drift()}×" if tokens.drift() else ""))
+    cascade = cascade_summary([t for p in players.values() for t in p.history]) if "cascade" in settings else None
+    if cascade is not None:
+        reasons = "、".join(f"{k} {v}" for k, v in sorted(cascade["escalations"].items())) or "无"
+        print(f"   级联（{settings['cascade_mode']}，{a.model} → {a.strong}）：{cascade['strong_turns']}/{cascade['turns']} 回合由强模型作答；"
+              f"调用 {cascade['calls']}（强 {cascade['strong_calls']}）；升级原因：{reasons}")
     if a.out:
         log = {
             # the rules this journal was written under: replay must use the same ones
@@ -111,11 +139,25 @@ def cmd_play(a: argparse.Namespace) -> int:
         }
         if cassette is not None:
             log["cassette"] = os.path.basename(cassette.path)
+        if cascade is not None:
+            log.update({"strong": a.strong, "cascade": settings["cascade_mode"], "cascade_summary": cascade})
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         with open(a.out, "w") as f:
             json.dump(log, f, ensure_ascii=False, indent=1, default=str)
         print(f"   wrote {a.out}")
     return 0
+
+
+def cascade_summary(turns: list) -> dict:
+    """Per game: how many turns and calls each tier took, and the escalations by reason."""
+    from collections import Counter
+    rows = [t.cascade for t in turns if t.cascade is not None]
+    calls = [c for r in rows for c in r["calls"]]
+    return {"turns": len(rows), "strong_turns": sum(1 for r in rows if r["tier"] == "strong"),
+            "escalated_turns": sum(1 for r in rows if r["escalations"]),
+            "escalations": dict(Counter(e["reason"] for r in rows for e in r["escalations"])),
+            "calls": len(calls), "strong_calls": sum(1 for c in calls if c["tier"] == "strong"),
+            "tokens_by_model": dict(sum((Counter({c["model"]: c["prompt"] + c["completion"]}) for c in calls), Counter()))}
 
 
 def cmd_replay_llm(a: argparse.Namespace) -> int:
@@ -285,6 +327,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="最多几个座位同时想（投票、复盘、夜里互不依赖的角色）；1 = 一个一个来")
     pl.add_argument("--record", action="store_true",
                     help="录下每一次模型调用（请求+回复/错误），写在 --out 旁边的 .cassette.jsonl")
+    # model cascade (players/llm/cascade.py, docs/adr/0014): --model is then the cheap tier
+    pl.add_argument("--strong", default=None, help="级联的强模型（--model 是便宜模型），例如 claude-cli:sonnet")
+    pl.add_argument("--cascade", default="off", choices=["off", "on-fail", "decisive", "both"],
+                    help="on-fail：便宜模型的回复没过校验（格式/未知工具/非法参数/守卫拦截/无据引用/步数用尽/无应答）"
+                         "就在同一回合、同一份对话上换强模型重试；decisive：关键回合（--decisive）直接用强模型；both：两者都要")
+    pl.add_argument("--decisive", default=None,
+                    help="关键回合，逗号分隔的任务名或终结工具名（默认 vote,night,hunter_shoot,badge）")
+    pl.add_argument("--low-confidence", action="store_true", dest="low_confidence",
+                    help="另外：便宜模型的发言一个座位号都没提（没有可核对的内容），就让强模型重答")
     rl = sub.add_parser("replay-llm", help="用录像重跑一局：真实的 LLMPlayer，模型换成录像，核对 journal")
     rl.add_argument("file")
     rl.add_argument("--cassette", default=None, help="录像路径（默认看日志里的 cassette 字段或日志旁边）")

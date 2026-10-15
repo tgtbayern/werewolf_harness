@@ -92,6 +92,12 @@ def make_key(seat, turn, task, call: int, kind: str) -> str:
     return f"{seat}/{turn}/{task}/{call}/{kind}"
 
 
+def client_id(seat, tier: str | None = None):
+    """How a seat's client is registered in a cassette: the seat, or "<seat>:<tier>" for a
+    seat's second model (the strong tier of a cascade)."""
+    return seat if tier is None else f"{seat}:{tier}"
+
+
 # ------------------------------------------------------------------ canonical request
 def _canon(v) -> str:
     """Key order is kept, not sorted. The wire JSON keeps it too, so two requests whose
@@ -345,24 +351,33 @@ class RecordingClient(LLMClient):
     recovery's hard deadline would. Otherwise a call that overran would be recorded
     with the reply that eventually arrived while the game had already moved on with
     a timeout -- and the replay would play a different game.
+
+    ``tier`` names a second client of the same seat (the strong model of a cascade,
+    players/llm/cascade.py). Its calls share the seat's per-turn call counter -- an
+    escalated retry is just the next call of the turn, so the key format is unchanged --
+    and its model name is registered as client "<seat>:<tier>", which is what the
+    ReplayClient for that tier reads back. The model is part of the request hash, so
+    replaying a call on the wrong tier is a divergence, never a silent substitution.
     """
 
-    def __init__(self, inner: LLMClient, cassette: CassetteWriter, *, seat=None, turn_prefix=None):
+    def __init__(self, inner: LLMClient, cassette: CassetteWriter, *, seat=None, turn_prefix=None,
+                 tier: str | None = None):
         self.inner = inner
         self.cassette = cassette
         self.seat = seat
         self.turn_prefix = turn_prefix
+        self.tier = tier
         self.name = getattr(inner, "name", "unknown")
         self.tool_mode = getattr(inner, "tool_mode", "native")
         if seat is not None:
-            cassette.client(seat, self.name, self.tool_mode)
+            cassette.client(client_id(seat, tier), self.name, self.tool_mode)
 
     def _key(self) -> tuple[str, Scope]:
         sc = current_scope() or Scope(self.seat if self.seat is not None else "-", "-", "-", "step")
         seat = sc.seat if sc.seat is not None else self.seat
         turn = sc.turn if self.turn_prefix is None else f"{self.turn_prefix}.{sc.turn}"
         if seat is not None:
-            self.cassette.client(seat, self.name, self.tool_mode)
+            self.cassette.client(client_id(seat, self.tier), self.name, self.tool_mode)
         n = self.cassette.next_call(seat, turn)
         return make_key(seat, turn, sc.task, n, sc.kind), sc
 
@@ -491,12 +506,15 @@ class ReplayClient(LLMClient):
     """
 
     def __init__(self, cassette: Cassette, seat, *, allow_drift: bool = False, turn_prefix=None,
-                 used: set | None = None, drifts: list | None = None, counters: dict | None = None):
+                 used: set | None = None, drifts: list | None = None, counters: dict | None = None,
+                 tier: str | None = None):
+        """`tier` replays a seat's second client (see RecordingClient); the two clients of
+        one seat must share `counters`, as their recorded calls shared one numbering."""
         self.cassette = cassette
         self.seat = seat
         self.allow_drift = allow_drift
         self.turn_prefix = turn_prefix
-        info = cassette.clients.get(str(seat)) or {}
+        info = cassette.clients.get(str(client_id(seat, tier))) or {}
         self.name = info.get("name", "replay")
         self.tool_mode = info.get("tool_mode", "native")
         self.used = used if used is not None else set()

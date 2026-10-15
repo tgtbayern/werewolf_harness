@@ -15,6 +15,7 @@ speech is ~400 tokens; the default mock line is ten words). The decision itself
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
@@ -237,3 +238,78 @@ class ChaosMockClient(MockClient):
         if not r.tool_calls and tools is None:
             r.text = f"记一下：第 {salt % 7} 号可疑。"
         return r
+
+
+class FlakyMockClient(MockClient):
+    """A seeded mock that is worse at the job: the "cheap model" of the cascade experiments.
+
+    Unlike ChaosMockClient it is deterministic -- every choice is drawn from
+    (seed, the request) -- so two arms of a paired experiment that reach the same
+    prompt get the same cheap-model reply, and a game played twice is the same
+    game. With probability ``bad_rate`` per call it makes one of the mistakes a
+    small model makes, in equal shares:
+
+      malformed   prose, no tool call
+      unknown     a tool that does not exist
+      illegal     a real terminal with an argument outside its enum (seat 99)
+      vague       (speech only) a speech that names no seat
+      cite        (speech only) "N号说过……" about a seat it never looked up
+
+    The rest of the time it is the plain mock. Its ``name`` is what prices and
+    recordings key on, so the two tiers of a cascade must not share one.
+    """
+
+    name = "mock-flaky"
+    KINDS = ("malformed", "unknown", "illegal", "vague", "cite")
+
+    def __init__(self, seed: int = 0, bad_rate: float = 0.25, name: str | None = None, **kw):
+        super().__init__(seed=seed, name=name or "mock-flaky", **kw)
+        self.bad_rate = bad_rate
+
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+        digest = hashlib.sha256(json.dumps([self.seed, messages, [t["function"]["name"] for t in tools or []]],
+                                           ensure_ascii=False, default=str).encode()).hexdigest()
+        rng = random.Random(digest)
+        resp = super().chat(messages, tools, temperature, max_tokens, timeout)
+        if not tools or rng.random() >= self.bad_rate:
+            return resp
+        call = resp.tool_calls[0] if resp.tool_calls else None
+        speech = call is not None and isinstance(call.arguments.get("content"), str)
+        kind = rng.choice([k for k in self.KINDS if speech or k not in ("vague", "cite")])
+        if kind == "malformed" or call is None:
+            return LLMResponse(text="嗯……我想想再说。", latency_ms=self.latency_ms, model=self.name,
+                               prompt_tokens=resp.prompt_tokens, completion_tokens=8)
+        args, name = dict(call.arguments), call.name
+        if kind == "unknown":
+            name = "reveal_all_roles"
+        elif kind == "illegal":
+            fn = next(t["function"] for t in tools if t["function"]["name"] == call.name)
+            enum_keys = [k for k, p in fn.get("parameters", {}).get("properties", {}).items() if p.get("enum")]
+            args = {**args, enum_keys[0]: 99} if enum_keys else {"bogus": True}
+        elif kind == "vague":
+            args["content"] = "我没有什么特别的看法，大家继续发言吧，我听听再说。"
+        else:
+            m = _SELF.search(messages[0]["content"] if messages else "")
+            me = int(m.group(1)) if m else 0
+            other = rng.choice([s for s in range(1, 9) if s != me])
+            args["content"] = f"{other}号说过他是预言家，还说“我昨晚查验了三号是好人”，我觉得他在骗人。"
+        raw = json.dumps(args, ensure_ascii=False)
+        bad = ToolCall(name=name, arguments=args, id=call.id, raw_arguments=raw)
+        return LLMResponse(text="", tool_calls=[bad], prompt_tokens=resp.prompt_tokens,
+                           completion_tokens=resp.completion_tokens, latency_ms=self.latency_ms, model=self.name)
+
+
+def cascade_mock(model: str, seed: int) -> MockClient | None:
+    """The two offline tiers of a cascade, by name (None for any other model):
+
+        mock-strong            the plain mock under its own name (reports 6 ms a call)
+        mock-flaky[:bad_rate]  FlakyMockClient, default bad_rate 0.25 (reports 3 ms a call)
+
+    The reported latencies only make the latency columns of a mock experiment
+    distinguishable; nothing sleeps."""
+    if model == "mock-strong":
+        return MockClient(seed=seed, name="mock-strong", latency_ms=6)
+    if model.startswith("mock-flaky"):
+        rate = float(model.split(":", 1)[1]) if ":" in model else 0.25
+        return FlakyMockClient(seed=seed, bad_rate=rate, name=model, latency_ms=3)
+    return None
