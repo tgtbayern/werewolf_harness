@@ -64,7 +64,7 @@ prometheus (healthy) ──> grafana (healthy)
 | job | 内容 |
 |---|---|
 | `unit` | Python 3.10 / 3.12 矩阵；按 `requirements-dev.lock` 装依赖（pip 缓存）；`make lint`（ruff）+ `make test-core` |
-| `integration` | 同一矩阵；`postgres:16`、`redis:7` 作为 service；`make test-int`；之后依次尝试 `make compat`、`make faults`、`make regress`——目标存在才跑，不存在就跳过，后续阶段加上目标后 CI 不用改 |
+| `integration` | 同一矩阵；`postgres:16`、`redis:7` 作为 service；`make test-int`；之后依次尝试 `make compat`、`make faults-quick`（故障注入的 CI 子集，ADR 0013）、`make regress`——目标存在才跑，不存在就跳过 |
 | `docker` | buildx 构建（GHA 层缓存）→ `make smoke BUILD=--no-build`（整套 compose，含 Grafana）→ 失败时打印 compose 日志 → QEMU 构建 linux/arm64 |
 | `image` / `deploy` | 只在 main 上：推送 amd64+arm64 镜像到 ghcr；配置了 `DEPLOY_HOST` 才滚动重启 VPS（先 migrate，再 worker、api2、api1，每步 `--wait`） |
 
@@ -84,6 +84,20 @@ prometheus (healthy) ──> grafana (healthy)
 - **基础镜像是替身**：沙箱屏蔽了所有镜像仓库，所以 `python:3.12-slim`、`postgres:16-alpine`、`redis:7-alpine`、`caddy:2-alpine`、`prom/prometheus` 用 Ubuntu 24.04 软件包在本地做了同名替身（入口和路径与官方一致）。compose 编排、healthcheck、依赖顺序、端口、卷、应用镜像本身都是真的；官方镜像上的行为差异（比如 alpine 的 `wget`、官方 postgres 入口脚本）在 Mac 上跑 `make smoke` 时才会最终确认。
 - **arm64 / Apple Silicon**：只检查了基础镜像和锁里的 wheel 都有 arm64 版本；没有在 arm64 上实际构建。
 - **Jaeger**（`--profile tracing`）：没跑。
+
+## Mac（Apple Silicon）实测（2026-10-15）
+
+机器：MacBook Pro M3 Pro（11 核，18 GB），Docker Desktop 28.1.1，compose v2.35.1，全部官方镜像，原生 arm64，不走模拟。上一节里沙箱没能验证的三项（官方基础镜像、Grafana、arm64），在这里都实际跑过了。
+
+| 项 | 结果 |
+|---|---|
+| `make smoke` | **全部通过**：Caddy → `/readyz`；8 人全 mock 局打完（33 回合、3.3 s、0 次规则兜底）；API 与 worker 的 `/metrics`；Prometheus 抓取目标全部 up（api1、api2、两个 worker 副本）；Prometheus 查到对局指标；模型回合经 Redis Streams 由两个 worker 执行（17 / 16 个）；**Grafana 看板自动加载**；回放校验 0 不一致；宿主机 → Caddy 通 |
+| 冷启动（拉官方镜像 + 构建应用镜像 + 起整套 + 冒烟） | 116 s |
+| `make up`（不构建），全新数据卷 / 已有数据卷 | 25.9 s / 17.4 s（含 Grafana 和 Prometheus 的 healthcheck） |
+| 应用镜像 `werewolf-harness:local` | arm64；`docker image ls` 显示 341 MB（解包后），压缩后 72 MB |
+| 故障切换 | 停掉 api1 后，经 Caddy 的 `/readyz` 由 `node-2` 应答；api1 重新启动到 `/readyz` 200 用 7.5 s，之后切回 `node-1` |
+
+这台机器上 8080、8402、3000 端口已经被别的程序占用，所以这次把端口都改到了 1xxxx 段：`HTTP_PORT=18080 HTTPS_PORT=18443 API_PORT=18402 PROMETHEUS_PORT=19090 GRAFANA_PORT=13000 make smoke`。
 
 ## 在 Mac（Apple Silicon）上第一次跑
 
