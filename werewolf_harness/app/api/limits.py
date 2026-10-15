@@ -13,6 +13,10 @@ import uuid
 
 from redis.asyncio import Redis
 
+from ..obs import logging as olog
+
+log = olog.get("api.limits")
+
 _SLIDING = """
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -33,11 +37,20 @@ class SlidingWindow:
     def __init__(self, redis: Redis):
         self.r = redis
         self._script = redis.register_script(_SLIDING)
+        self.failed_open = 0
 
     async def hit(self, key: str, limit: int, window_ms: int) -> tuple[bool, int]:
-        """(allowed, retry_after_ms)."""
+        """(allowed, retry_after_ms). Fails open: with Redis away (restarting, a pooled
+        connection whose socket died with it) every request was a 500, so a limit meant to
+        protect the API took it down. For that moment nobody is limited."""
         now = int(time.time() * 1000)
-        ok, retry = await self._script(keys=[f"rl:{key}"], args=[now, window_ms, limit, f"{now}-{uuid.uuid4().hex[:8]}"])
+        try:
+            ok, retry = await self._script(keys=[f"rl:{key}"],
+                                           args=[now, window_ms, limit, f"{now}-{uuid.uuid4().hex[:8]}"])
+        except Exception as exc:                           # noqa: BLE001 -- ConnectionError, or RuntimeError from a dead transport
+            self.failed_open += 1
+            log.warning("rate limit unavailable, letting the request through: %s", str(exc)[:120])
+            return True, 0
         return bool(ok), int(retry)
 
 

@@ -91,6 +91,7 @@ class StreamExecutor:
         self.out: dict[str, dict[tuple[int, int], float]] = {}
         self.held: dict[str, deque[AgentJob]] = {}
         self.latency = LatencyWindow()                     # per-turn service time on the workers
+        self.send_retries = 0
         self._task: asyncio.Task | None = None
         self._last_id = "$"
 
@@ -141,8 +142,26 @@ class StreamExecutor:
                   "reply_to": self.node, "enq": time.time(), "lane": job.lane,
                   "stream": "1" if job.stream else "0", "job_id": job.job_id,
                   "tp": json.dumps(tracing.to_carrier(job.trace_ctx)) if job.trace_ctx is not None else ""}
-        asyncio.get_running_loop().create_task(
-            self.r.xadd(jobs_key(job.lane), fields, maxlen=100_000, approximate=True))
+        asyncio.get_running_loop().create_task(self._send(job, fields))
+
+    async def _send(self, job: AgentJob, fields: dict) -> None:
+        """XADD the job, retrying through a Redis blip. A job that never reached the stream
+        used to be noticed only by the turn's deadline (agent_timeout_s, then the default
+        action). Gives up once the job is no longer wanted (cancelled: its slot is gone)."""
+        delay = 0.2
+        while True:
+            try:
+                await self.r.xadd(jobs_key(job.lane), fields, maxlen=100_000, approximate=True)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                       # noqa: BLE001
+                if (job.seat, job.version) not in self.out.get(job.game_id, {}):
+                    return
+                self.send_retries += 1
+                log.warning("could not queue a model job (%s): retrying in %.1fs", str(exc)[:120], delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
 
     def cancel(self, job: AgentJob, reason: str) -> None:
         """Stop a job. One still held on this node (per-game cap) never goes out. One in
@@ -161,6 +180,10 @@ class StreamExecutor:
         msg = json.dumps({"job_id": job.job_id, "game_id": job.game_id, "seat": job.seat, "version": job.version,
                           "reason": reason})
         asyncio.get_running_loop().create_task(self._publish_cancel(msg))
+        # Its answer is not wanted, so it no longer holds one of the game's places in the
+        # stream. Waiting for the worker's reply to give it back would block the game's next
+        # asks for agent_timeout_s whenever that reply never comes (Redis lost the job).
+        self._settle(job.game_id, job.seat, job.version)
 
     async def _publish_cancel(self, msg: str) -> None:
         try:
@@ -250,7 +273,7 @@ class Worker:
 
     def __init__(self, settings: Settings, store, redis: Redis, hub, *, consumer: str | None = None,
                  concurrency: int = 8, env_keys: dict | None = None, claim_idle_ms: int | None = None,
-                 max_deliveries: int = 3):
+                 max_deliveries: int = 3, store_calls: bool = False):
         self.s, self.store, self.r, self.hub = settings, store, redis, hub
         self.consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
         self.sem = asyncio.Semaphore(concurrency)
@@ -259,7 +282,13 @@ class Worker:
         # load testing found capping a 2-core worker at ~6 turns in flight (~8 commits/s)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="turn")
         self.env_keys = env_keys or {}
-        self.claim_idle_ms = claim_idle_ms or int(settings.agent_timeout_s * 1000)
+        # A job a worker took and stopped working on is claimed by another after it sat this
+        # long unacknowledged. Workers keep the jobs they are running fresh (_keepalive_loop),
+        # so this measures how long a worker has been dead, not how long its turn takes.
+        self.claim_idle_ms = claim_idle_ms or getattr(settings, "claim_idle_ms", 0) or int(settings.agent_timeout_s * 1000)
+        self.store_calls = store_calls                    # write the hub's model-call records to Postgres
+        self.held: dict[bytes | str, str] = {}            # entry id -> lane, for jobs running here
+        self.redis_errors = 0
         self.max_deliveries = max_deliveries
         self.done = 0
         self.stale = 0
@@ -286,10 +315,31 @@ class Worker:
         reclaim = asyncio.create_task(self._reclaim_loop())
         beat = asyncio.create_task(self._announce_loop())
         self._tasks.add(asyncio.create_task(self._cancel_loop()))
+        self._tasks.add(asyncio.create_task(self._keepalive_loop()))
+        if self.store_calls:
+            self._tasks.add(asyncio.create_task(self._flush_loop()))
+        delay = 0.2
         try:
             while not self._stop:
                 await self.sem.acquire()
-                got = await self._next()
+                try:
+                    got = await self._next()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:                   # noqa: BLE001 -- Redis restarted or unreachable
+                    # A worker outlives Redis: it waits and reads again. A Redis that came back
+                    # empty has no consumer group (NOGROUP), so make it again.
+                    self.sem.release()
+                    self.redis_errors += 1
+                    log.warning("reading jobs failed (%s): retrying in %.1fs", str(exc)[:120], delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 3.0)
+                    try:
+                        await self.ensure_groups()
+                    except Exception:                      # noqa: BLE001 -- still down: next round
+                        pass
+                    continue
+                delay = 0.2
                 if got is None:
                     self.sem.release()
                     continue
@@ -340,6 +390,7 @@ class Worker:
         return lane, eid, f
 
     async def _handle(self, lane: str, eid, raw: dict) -> None:
+        self.held[eid] = lane
         try:
             f = {_s(k): _s(v) for k, v in raw.items()}
             self.order.append(lane)
@@ -351,10 +402,15 @@ class Worker:
                 # tell the node it was dropped, so the game's slot in the stream comes back
                 reply = {"game_id": f["game_id"], "seat": int(f["seat"]), "version": int(f["version"]), "stale": True}
             if f.get("reply_to"):
-                await self.r.xadd(results_key(f["reply_to"]), {"r": json.dumps(reply, ensure_ascii=False, default=str)},
-                                  maxlen=10_000, approximate=True)
-            await self.r.xack(jobs_key(lane), GROUP, eid)
+                body = {"r": json.dumps(reply, ensure_ascii=False, default=str)}
+                await _retry(lambda: self.r.xadd(results_key(f["reply_to"]), body, maxlen=10_000, approximate=True))
+            await _retry(lambda: self.r.xack(jobs_key(lane), GROUP, eid))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                           # noqa: BLE001 -- not acked: another worker runs it again
+            log.warning("job %s failed, left for a retry: %s", _s(eid), str(exc)[:200])
         finally:
+            self.held.pop(eid, None)
             self.sem.release()
 
     async def _run(self, f: dict) -> dict | None:
@@ -457,6 +513,35 @@ class Worker:
         for k in [k for k, t0 in self._cancel_early.items() if now - t0 > 600]:
             del self._cancel_early[k]
 
+    async def _keepalive_loop(self) -> None:
+        """Reset the idle time of every job running here (XCLAIM to ourselves, JUSTID), so
+        only a dead worker's jobs ever get idle enough to be claimed by another."""
+        while True:
+            await asyncio.sleep(max(0.2, self.claim_idle_ms / 3000))
+            by_lane: dict[str, list] = {}
+            for eid, lane in list(self.held.items()):
+                by_lane.setdefault(lane, []).append(eid)
+            for lane, ids in by_lane.items():
+                try:
+                    await self.r.xclaim(jobs_key(lane), GROUP, self.consumer, 0, ids, justid=True)
+                except Exception:                          # noqa: BLE001 -- redis blip: next round
+                    pass
+
+    async def _flush_loop(self) -> None:
+        """Model-call records made here go to Postgres, as an API node's do (runtime.flush_calls)."""
+        while True:
+            await asyncio.sleep(1.0)
+            await self.flush_calls()
+
+    async def flush_calls(self) -> int:
+        rows = [r.to_row() for r in self.hub.sink.drain(5000)] if self.hub is not None else []
+        if rows:
+            try:
+                await self.store.record_calls(rows)
+            except Exception:                              # noqa: BLE001 -- accounting must not stop turns
+                log.exception("could not write llm_calls")
+        return len(rows)
+
     async def _reclaim_loop(self) -> None:
         """Jobs a dead worker took and never acknowledged: claim them after they sit idle."""
         while True:
@@ -468,19 +553,37 @@ class Worker:
                 except Exception:                          # noqa: BLE001
                     continue
                 for eid, fields in (res[1] if res else []):
-                    if not fields:
+                    if not fields or eid in self.held:
                         continue
-                    info = await self.r.xpending_range(jobs_key(lane), GROUP, min=eid, max=eid, count=1)
-                    tries = info[0]["times_delivered"] if info else 1
-                    if tries > self.max_deliveries:
-                        self.dead += 1
-                        await self.r.xadd("llm:dead", {k: v for k, v in fields.items()}, maxlen=10_000)
-                        await self.r.xack(jobs_key(lane), GROUP, eid)
+                    try:
+                        info = await self.r.xpending_range(jobs_key(lane), GROUP, min=eid, max=eid, count=1)
+                        tries = info[0]["times_delivered"] if info else 1
+                        if tries > self.max_deliveries:
+                            self.dead += 1
+                            await self.r.xadd("llm:dead", {k: v for k, v in fields.items()}, maxlen=10_000)
+                            await self.r.xack(jobs_key(lane), GROUP, eid)
+                            continue
+                    except Exception:                      # noqa: BLE001 -- redis blip: it is claimed again later
                         continue
                     await self.sem.acquire()
                     t = asyncio.create_task(self._handle(lane, eid, fields))
                     self._tasks.add(t)
                     t.add_done_callback(self._tasks.discard)
+
+
+async def _retry(op, tries: int = 6, delay: float = 0.2):
+    """A Redis write that must not be lost to a blip: a few tries with backoff (about 6 s),
+    then the error goes up (the job stays unacknowledged and is claimed and run again)."""
+    for i in range(tries):
+        try:
+            return await op()
+        except asyncio.CancelledError:
+            raise
+        except Exception:                                  # noqa: BLE001
+            if i == tries - 1:
+                raise
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
 
 
 def _s(v) -> str:
@@ -503,10 +606,11 @@ async def main() -> None:
     r = Redis.from_url(s.redis_url)
     env = read_env()
     hub = Hub(s.redis_url, env_keys=env, tpm=s.llm_tpm, default_tpm=s.llm_default_tpm)
-    w = Worker(s, store, r, hub, concurrency=s.agent_workers, env_keys=env)
+    w = Worker(s, store, r, hub, concurrency=s.agent_workers, env_keys=env, store_calls=True)
     log.info("worker %s up", w.consumer)
     try:
         await w.run()
     finally:
+        await w.flush_calls()
         await store.close()
         await r.aclose()

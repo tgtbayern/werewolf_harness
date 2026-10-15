@@ -55,6 +55,7 @@ python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku
 | 排行榜 | Redis ZSET（同分按先到者排前）；模型按阵营统计胜率 | `app/api/leaderboard.py` |
 | 可观测 | Prometheus 指标 + Grafana 看板；OpenTelemetry：turn → invoke_agent → chat，跨线程、跨进程 | `app/obs/` |
 | 提示缓存 | system message 按变化频率排序；模拟缓存命中率 62.9% → 68.8% | ADR 0006 |
+| 故障注入 | 真实进程上 kill -9 worker / 节点、Redis 与 Postgres 重启、网络故障、模型故障窗口、重复投递、旧 owner 醒来；每个场景后自动检查 7 条不变量 | `faults/`，ADR 0013 |
 
 所有数字、口径和样本量都在 `docs/numbers.md`。
 
@@ -62,6 +63,7 @@ python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku
 
 ```
 make chaos        # 两个节点，kill -9 其中一个，看另一个接管（约 5 s，由租约 TTL 决定）
+make faults       # 故障注入：真实多进程 + 故障代理，7 个场景 × 7 条不变量 → faults/report.md（约 3 分钟；faults-quick 是 CI 子集）
 make bench        # 接管耗时、空闲资源占用、优先级排队、故障演练、缓存命中
 make load         # WebSocket 压测（先 make run）
 python -m werewolf_harness.scripts.verify_replay   # 已结束的局逐一重放，检查结局一致

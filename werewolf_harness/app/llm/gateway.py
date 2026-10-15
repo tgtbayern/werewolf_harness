@@ -146,6 +146,9 @@ class Hub:
             return MockClient.named(model, seed)
         if model in SIM_PROFILES:
             return SimClient(seed, name=model, cache=self.sim_cache, sleep=self.sim_sleep, **SIM_PROFILES[model])
+        from ...faults import model as faults_model
+        if model == faults_model.MODEL and faults_model.enabled():
+            return faults_model.FaultMockClient(seed)      # fault-injection runs only (faults/)
         from ...players.providers.mock import cascade_mock
         offline = cascade_mock(model, seed)            # mock-strong / mock-flaky: a cascade's offline tiers
         if offline is not None:
@@ -155,9 +158,12 @@ class Hub:
 
     def client(self, model: str, seed: int, *, game_id: str | None, seat: int | None, seq: int | None,
                max_game_tokens: int | None, fallbacks: list[str] | None = None) -> GatewayClient:
-        chain = [model] + [m for m in (fallbacks or []) if m != model]
-        return GatewayClient(self, [(m, self.raw_client(m, seed)) for m in chain], game_id=game_id, seat=seat,
-                             seq=seq, max_game_tokens=max_game_tokens)
+        chain = [(m, self.raw_client(m, seed)) for m in [model] + [m for m in (fallbacks or []) if m != model]]
+        for _m, c in chain:
+            bind = getattr(c, "bind_call", None)           # a test seat that logs which turn it is called for
+            if bind is not None:
+                bind(game_id, seat, seq)
+        return GatewayClient(self, chain, game_id=game_id, seat=seat, seq=seq, max_game_tokens=max_game_tokens)
 
 
 class GatewayClient(LLMClient):

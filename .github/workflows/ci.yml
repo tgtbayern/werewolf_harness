@@ -78,10 +78,12 @@ jobs:
         run: make -C $PKG test-int PY=python PYTEST_ARGS="--timeout 180 -p no:cacheprovider"
       # Slots for later phases. Each runs only once its Makefile target exists, so this
       # file need not change when they land: `make compat` (old journals still replay),
-      # `make faults` (fault injection), `make regress` (regression replays).
+      # `make faults-quick` (fault injection, the CI subset), `make regress` (regression replays).
       - name: compat / fault-injection / regression replays (when present)
+        env:
+          FAULTS_OUT: /tmp/faults-quick.md
         run: |
-          for t in compat faults regress; do
+          for t in compat faults-quick regress; do
             if make -C $PKG -n "$t" >/dev/null 2>&1; then
               echo "::group::make $t"; make -C $PKG "$t" PY=python; echo "::endgroup::"
             else

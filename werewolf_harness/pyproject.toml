@@ -49,4 +49,6 @@ ignore = ["E501", "B008"]
 "server/*" = ["ALL"]
 "tests/test_*.py" = ["ALL"]
 "scripts/*" = ["ASYNC110"]  # benches poll on purpose
+# the fault harness polls, blocks and spawns on purpose: it drives processes, it is not one
+"faults/*" = ["ASYNC110", "ASYNC221", "ASYNC230", "ASYNC240"]
 "*.py" = []

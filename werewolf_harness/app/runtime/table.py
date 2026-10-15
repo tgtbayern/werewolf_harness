@@ -250,10 +250,10 @@ class Table:
             tiers = {"strong_client": self._seat_client(strong, seat, version, client_factory, tier="strong"),
                      "cascade": self.cascade_policy}
             timeout = max(timeout, profile(strong)["timeout_s"])   # one policy serves both tiers
-        # Behind the gateway, fallbacks and backoff already happened once per call;
-        # retrying the whole chain again at the seat only multiplies the wait.
-        pol = RecoveryPolicy(timeout_s=timeout,
-                             max_transport_retries=0 if self.hub is not None else RecoveryPolicy.max_transport_retries)
+        # The gateway tries each model of the chain once, with no pause between. So the
+        # seat retries the whole chain, with backoff: without it one 503 from the only model
+        # turned the turn into the default action (faults/report.md, model_faults).
+        pol = RecoveryPolicy(timeout_s=timeout, backoff_s=1.0 if self.hub is not None else RecoveryPolicy.backoff_s)
         budget = self.transport if (self.cfg.abort_on_outage or self.hub is None) else None
         return LLMPlayer(client, guard=self.guard, policy=pol, transport_budget=budget,
                          token_budget=self.tokens, playbook=self.cfg.playbook != "none",

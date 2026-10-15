@@ -14,7 +14,7 @@ SMOKE_ARGS ?=
 # CI builds the image with buildx (layer cache) first and passes BUILD=--no-build
 BUILD ?= --build
 
-.PHONY: dev run worker test test-core test-int lint migrate bench chaos load lock up down down-v ps logs smoke compat compat-db
+.PHONY: dev run worker test test-core test-int lint migrate bench chaos faults faults-quick load lock up down down-v ps logs smoke compat compat-db
 
 dev:            ## Postgres + Redis + Jaeger in Docker
 	docker compose -f deploy/docker-compose.dev.yml up -d
@@ -36,13 +36,17 @@ compat:         ## every stored journal replays under its recorded engine versio
 compat-db:      ## the same check over every game in Postgres (DATABASE_URL) -- run before deploying a new engine version
 	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.compat_check --db --fingerprint
 lint:
-	$(PY) -m ruff check app tests/integration scripts loadtest
+	$(PY) -m ruff check app tests/integration scripts loadtest faults
 bench:
 	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.bench_runtime && $(PY) -m werewolf_harness.scripts.bench_llm \
 	  && $(PY) -m werewolf_harness.scripts.measure_prompt_cache \
 	  && $(PY) -m werewolf_harness.scripts.bench_streaming
 chaos:          ## kill -9 a node mid-game and watch the other one adopt it
 	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.chaos_demo
+faults:         ## fault injection: real processes, every scenario, scenario x invariant matrix -> faults/report.md
+	cd $(ROOT) && $(PY) -m werewolf_harness.faults run $(FAULTS_ARGS)
+faults-quick:   ## the CI subset (< 90 s); in CI Postgres/Redis are shared services, restarts are emulated
+	cd $(ROOT) && $(PY) -m werewolf_harness.faults run --quick --out $(or $(FAULTS_OUT),werewolf_harness/faults/report-quick.md) $(FAULTS_ARGS)
 load:           ## WebSocket load test against a running server
 	cd $(ROOT) && $(PY) -m werewolf_harness.loadtest.bots --tables 200
 LOCK = uv pip compile pyproject.toml --universal --python-version 3.10 --generate-hashes --no-header --no-annotate --quiet

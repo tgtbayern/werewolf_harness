@@ -88,7 +88,8 @@ LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky",
 
 def _playable(env_keys: dict) -> list[str]:
     """Every model a seat can actually be filled with right now."""
-    return offered(env_keys) + LOCAL_MODELS
+    from ...faults import model as faults_model
+    return offered(env_keys) + LOCAL_MODELS + ([faults_model.MODEL] if faults_model.enabled() else [])
 
 
 def create_app(settings: Settings | None = None, *, migrate_on_start: bool = True, executor=None,
@@ -443,10 +444,12 @@ def _routes(app: FastAPI) -> None:
             while True:
                 if await request.is_disconnected():
                     return
-                if drafts:
-                    await a.wait_any(cur["next"], cur["dlast"], timeout=15)
-                else:
-                    await a.wait_events(cur["next"], timeout=15)
+                if a.stopped is None:                      # a stopped actor rings no bell: send what is left, end
+                    if drafts:
+                        await a.wait_any(cur["next"], cur["dlast"], timeout=15)
+                    else:
+                        await a.wait_events(cur["next"], timeout=15)
+                if not drafts:
                     cur.update(epoch=a.t.draft_epoch, dlast=a.t.dseq - 1)     # skip drafts
                 for op, body in outbox(a.t, None, cur):
                     data = json.dumps(body, ensure_ascii=False, default=str)
@@ -479,6 +482,11 @@ def _routes(app: FastAPI) -> None:
     async def ws(websocket: WebSocket, gid: str, token: str | None = None, last_seq: int = -1,
                  epoch: int | None = None, dseq: int = -1):
         await _ws_session(websocket, gid, token, last_seq, epoch, dseq)
+
+
+# Why an actor stops when the game goes on elsewhere (runtime.py / actor.py). Finished,
+# aborted and crashed games stay where they are: their last events say so.
+MOVED = ("lease_lost", "fenced", "db", "shutdown")
 
 
 async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_seq: int,
@@ -517,9 +525,18 @@ async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_se
 
     async def pusher() -> None:
         while True:
-            await a.wait_any(cursor["next"], cursor["dlast"], timeout=s.s.heartbeat_s)
+            if a.stopped not in MOVED:
+                # (a stopped actor rings no bell: waiting on it would hold a client that
+                # connected in the instant before the node let go for a whole heartbeat)
+                await a.wait_any(cursor["next"], cursor["dlast"], timeout=s.s.heartbeat_s)
             for op, body in outbox(a.t, seat, cursor):
                 await websocket.send_json({"op": op, **body})
+            if a.stopped in MOVED and cursor["next"] >= len(a.t.events):
+                # This node no longer drives the game (lease lost, fenced, out of database):
+                # nothing more will come through this actor. Close so the client reconnects
+                # and lands on whichever node adopts it, resuming from its cursor.
+                await websocket.close(code=4409, reason=f"game moved ({a.stopped})")
+                return
             if time.monotonic() - last_seen["t"] > s.s.heartbeat_s * 2:
                 metrics.WS_HEARTBEAT_TIMEOUTS.inc()
                 await websocket.close(code=4000, reason="heartbeat timeout")

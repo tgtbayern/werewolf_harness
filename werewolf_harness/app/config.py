@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     recovery_scan_s: float = 5.0        # how often a node looks for games nobody holds
     recovery_batch: int = 50            # orphaned games adopted per round trip during a scan
     agent_timeout_s: float = 240.0      # a model turn that takes longer is replaced by the fallback
+    claim_idle_ms: int = 15_000         # a job unacknowledged this long by a silent worker is run by another
     human_turn_s: float = 300.0
 
     # model layer
