@@ -23,6 +23,7 @@ from typing import Any
 from .arena import Terminal, Turn, run
 from .envs import VARIANTS, Werewolf, engine_version_of
 from .players import GuardStack, LLMPlayer, TokenBudget, TransportBudget
+from .players.llm.cascade import CascadePolicy
 from .players.providers.recorded import Cassette, ReplayClient, ReplayDivergence, cassette_path_for
 from .players.recovery import RecoveryPolicy
 
@@ -45,16 +46,25 @@ def settings_of(log: dict) -> dict:
     return s
 
 
-def build_players(s: dict, n: int, client_for, *, policy_for=None) -> tuple[dict, TokenBudget, GuardStack]:
+def build_players(s: dict, n: int, client_for, *, policy_for=None, strong_for=None) -> tuple[dict, TokenBudget, GuardStack]:
     """The seats of `cli play`, built from its settings. One builder for play and replay, so
-    a replay cannot drift from the run it reproduces by a default someone changed in one place."""
+    a replay cannot drift from the run it reproduces by a default someone changed in one place.
+
+    With ``s["cascade"]`` (a CascadePolicy dict, players/llm/cascade.py) every seat gets a
+    second client from ``strong_for(seat)``: ``client_for`` is then the cheap tier."""
     guard = GuardStack(tuple(x for x in s["guard"].split(",") if x), evidence_forced=s["evidence"])
     budget = TransportBudget()
     tokens = TokenBudget(max_tokens=s["max_tokens"], max_usd=s["max_usd"])
+    cascade = CascadePolicy.from_dict(s.get("cascade"))
+    if cascade is not None and strong_for is None:
+        raise ValueError("these settings play a cascade: build_players needs strong_for")
+
+    def tiers(seat: int) -> dict:
+        return {"strong_client": strong_for(seat), "cascade": cascade} if cascade is not None else {}
     players = {seat: LLMPlayer(client_for(seat), guard=guard, transport_budget=budget, token_budget=tokens,
                                playbook=s["playbook"] != "none", temperature=s["temperature"], lang=s["lang"],
                                async_note=s["parallel"] > 1,
-                               **({"policy": policy_for(seat)} if policy_for else {}))
+                               **({"policy": policy_for(seat)} if policy_for else {}), **tiers(seat))
                for seat in range(1, n + 1)}
     return players, tokens, guard
 
@@ -129,13 +139,16 @@ def replay_game(log: dict, cas: Cassette, *, allow_drift: bool = False, upto: in
     s = settings_of(log)
     n = VARIANTS[log["variant"]].num_players
     rep = ReplayReport(recorded=len(cas.calls))
-    clients: dict[int, ReplayClient] = {}
+    clients: dict = {}
+    counters: dict = {}            # keyed (seat, turn): a seat's two cascade tiers share one numbering
 
-    def client_for(seat: int) -> ReplayClient:
-        clients[seat] = ReplayClient(cas, seat, allow_drift=allow_drift, used=rep.used, drifts=rep.drifts)
-        return clients[seat]
+    def client_for(seat: int, tier: str | None = None) -> ReplayClient:
+        clients[(seat, tier)] = ReplayClient(cas, seat, allow_drift=allow_drift, used=rep.used, drifts=rep.drifts,
+                                             counters=counters, tier=tier)
+        return clients[(seat, tier)]
 
-    players, _tokens, _guard = build_players(s, n, client_for, policy_for=lambda _seat: no_wait_policy())
+    players, _tokens, _guard = build_players(s, n, client_for, policy_for=lambda _seat: no_wait_policy(),
+                                             strong_for=lambda seat: client_for(seat, "strong"))
     for p in players.values():
         if on_player is not None:
             on_player(p)

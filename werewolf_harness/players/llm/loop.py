@@ -25,6 +25,7 @@ from ..providers.base import Cancelled, CancelToken, LLMClient, ToolCall
 from ..providers.recorded import call_scope
 from ..recovery import RecoveryPolicy, RecoveryStats, TransportBudget, call_model
 from .belief import BeliefState
+from .cascade import CascadePolicy
 from .context import ContextBuilder
 from .streaming import SPEECH_TOOLS, SpeechStream, expect_record, savings
 from .tools import InfoRegistry, SemanticError, ToolContext, build_registry
@@ -54,9 +55,18 @@ class ReActStep:
     guard_blocked: bool = False
     block_reason: str | None = None
     guard_detections: list[dict] = field(default_factory=list)
+    # Cascade only (players/llm/cascade.py): which model made this step's call, and why the
+    # turn moved to the strong model after it. Left out of the dict when unset, so a log
+    # written without a cascade (every log from before it) stays byte-identical.
+    model: str | None = None
+    escalated: str | None = None
 
     def to_dict(self) -> dict:
-        return self.__dict__.copy()
+        d = self.__dict__.copy()
+        for k in ("model", "escalated"):
+            if d[k] is None:
+                del d[k]
+        return d
 
 
 @dataclass
@@ -80,6 +90,10 @@ class TurnResult:
     model: str = ""
     note_ms: int = 0                 # the part of latency_ms spent writing the note
     draft_attempt: int | None = None  # which streamed draft became this turn's action (see on_draft)
+    # Cascade only: {"start": tier, "tier": the tier that answered, "escalations": [{step, reason,
+    # from, to}], "calls": [{kind, tier, model, prompt, completion, ms}]}. None, and absent from
+    # the log, otherwise.
+    cascade: dict | None = None
 
     @property
     def fallback_used(self) -> str | None:
@@ -91,6 +105,8 @@ class TurnResult:
             # only a streamed turn has one; a log written without streaming (every log from
             # before it, and every CLI game) stays byte-identical, so replay-llm compares equal
             d.pop("draft_attempt", None)
+        if d.get("cascade") is None:
+            d.pop("cascade", None)
         d["react_trace"] = [s.to_dict() for s in self.steps]
         return d
 
@@ -101,8 +117,22 @@ class LLMPlayer:
                  transport_budget: TransportBudget | None = None, anonymise_speakers: bool = False,
                  registry: InfoRegistry | None = None, token_budget: TokenBudget | None = None,
                  on_step=None, lang: str = "zh", async_note: bool = False, on_draft=None,
-                 cancel: CancelToken | None = None):
+                 cancel: CancelToken | None = None, strong_client: LLMClient | None = None,
+                 cascade: CascadePolicy | None = None):
         self.client = client
+        # Model cascade (players/llm/cascade.py): `client` is the cheap tier, `strong_client`
+        # the strong one. A turn's transcript is built once and may be continued by either,
+        # so both must speak the same tool protocol.
+        if cascade is not None:
+            if strong_client is None:
+                raise ValueError("a cascade needs strong_client")
+            modes = (getattr(client, "tool_mode", "native"), getattr(strong_client, "tool_mode", "native"))
+            if modes[0] != modes[1]:
+                raise ValueError(f"cascade tiers speak different tool protocols: {client.name} {modes[0]} / "
+                                 f"{strong_client.name} {modes[1]}")
+        self.strong_client = strong_client
+        self.cascade = cascade
+        self._tier = "cheap"
         # Streaming speech (docs/adr/0009). on_draft(kind, attempt, text) is told, while a
         # speech-like terminal is still being generated, what of its `content` has arrived
         # ("delta"), and when an attempt will not be the turn's answer after all ("abandon":
@@ -192,6 +222,13 @@ class LLMPlayer:
         result = TurnResult(view["you"], view["round"], task, belief_before=self.belief.snapshot(), note_before=self.note,
                             model=self.client.name)
         stats = RecoveryStats()
+        if self.cascade is not None:
+            self._tier, why = self.cascade.start(task, [t.name for t in spec.tools])
+            result.cascade = {"start": self._tier, "tier": self._tier, "escalations": [], "calls": []}
+            if why:
+                result.cascade["escalations"].append({"step": 0, "reason": why, "from": None,
+                                                      "to": self.strong_client.name})
+            result.model = self._active().name
         self.last_forced = False
         self._undo = (copy.deepcopy(self.belief), self.note, len(self.history))
         self._speechy = self.on_draft is not None and any(t.name in SPEECH_TOOLS for t in spec.tools)
@@ -209,6 +246,9 @@ class LLMPlayer:
             if self._note_thread is None:
                 result.note_after = self.note        # otherwise the note fills it in when it lands
             result.recovery = stats.to_dict()
+            if result.cascade is not None:
+                result.cascade["tier"] = self._tier
+                result.model = self._active().name     # the model whose answer the turn ended on
             self.history.append(result)
             self.last_turn = result
         result.action = action
@@ -239,9 +279,15 @@ class LLMPlayer:
 
         while step_no < self.policy.max_react_steps:
             step_no += 1
-            step = ReActStep(step_no)
-            response = self._call(messages, schemas, stats, kind="step")
+            step = ReActStep(step_no, model=self._active().name if self.cascade is not None else None)
+            response = self._call(messages, schemas, stats, kind="step", result=result)
             if response is None:
+                if self._escalate(result, step, "transport"):
+                    # the cheap model did not answer at all: the same request, to the strong one
+                    step.action, step.observation = "<no reply>", "the model did not answer"
+                    step.guard_blocked, step.block_reason = True, "transport"
+                    self._file(result, step)
+                    continue
                 stats.fallback_used = "transport_failure"
                 if self.transport_budget is not None:
                     self.transport_budget.spend()
@@ -265,8 +311,9 @@ class LLMPlayer:
                 schema_failures += 1
                 stats.retries += 1
                 step.action, step.observation, step.guard_blocked, step.block_reason = "<malformed>", "no valid tool call in the reply", True, "schema"
+                escalated = self._escalate(result, step, "schema")
                 self._file(result, step)
-                if schema_failures > self.policy.max_retries:
+                if schema_failures > self.policy.max_retries and not escalated:
                     break
                 messages.append({"role": "assistant", "content": response.text or ""})
                 messages.append({"role": "user", "content": "[guard] That reply contained no usable tool call. Reply with exactly one tool call and nothing else."})
@@ -289,8 +336,9 @@ class LLMPlayer:
                 allowed = sorted([t.name for t in info_tools] + terminal_names)
                 step.observation = f"unknown tool {call.name!r}; you may only call one of: {allowed}"
                 step.guard_blocked, step.block_reason = True, "schema"
+                escalated = self._escalate(result, step, "unknown_tool")
                 self._file(result, step)
-                if schema_failures > self.policy.max_retries:
+                if schema_failures > self.policy.max_retries and not escalated:
                     break
                 self._append_turn(messages, call, f"[guard] {step.observation}")
                 continue
@@ -313,13 +361,34 @@ class LLMPlayer:
                     step.guard_blocked, step.block_reason, step.observation = True, ("semantics" if reason else blocked["check"]), f"[guard] {why}"
                     if blocked:
                         result.guard_blocks.append({**blocked, "step": step_no})
+                    self._escalate(result, step, "illegal_args" if reason else f"guard:{blocked['check']}")
                     self._file(result, step)
                     self._append_turn(messages, call, f"[guard] {why}")
                     continue
                 args = term.normalise(call.arguments)
+                unsupported = (evidence_mod.unsupported_citations(args["content"], speaker=view["you"], lookups=lookups)
+                               if call.name in ("speak", "campaign_run", "last_words") else [])
+                if unsupported and self._escalate(result, step, "unsupported_citation"):
+                    # Without a cascade an unsupported citation is only counted; with one, the
+                    # cheap model's speech is refused and the strong model sees why.
+                    who = sorted({u["player_id"] for u in unsupported})
+                    why = (f"your speech attributes statements to player(s) {who} that you did not look up this turn; "
+                           "call query_history first, or do not quote them")
+                    step.guard_blocked, step.block_reason, step.observation = True, "unsupported_citation", f"[guard] {why}"
+                    self._file(result, step)
+                    self._append_turn(messages, call, f"[guard] {why}")
+                    continue
+                if self.cascade is not None and self._tier == "cheap" and \
+                        self.cascade.low_confidence_reply(call.name, args) and self._escalate(result, step, "low_confidence"):
+                    # Not refused, asked again: the strong model gets the transcript as it was
+                    # before this reply, not the reply itself.
+                    step.observation = "escalated: low confidence (the speech names no seat)"
+                    self._file(result, step)
+                    self._abandon("escalated")
+                    continue
                 self._file(result, step)
                 if call.name in ("speak", "campaign_run", "last_words"):
-                    result.hallucinated_citations = evidence_mod.unsupported_citations(args["content"], speaker=view["you"], lookups=lookups)
+                    result.hallucinated_citations = unsupported
                 result.draft_attempt = self._take_attempt(call.name)
                 self._note(messages, result, stats)
                 return {"name": call.name, "args": args}
@@ -330,8 +399,9 @@ class LLMPlayer:
                 schema_failures += 1
                 stats.retries += 1
                 step.guard_blocked, step.block_reason, step.observation = True, "schema", reason
+                escalated = self._escalate(result, step, "schema")
                 self._file(result, step)
-                if schema_failures > self.policy.max_retries:
+                if schema_failures > self.policy.max_retries and not escalated:
                     break
                 self._append_turn(messages, call, f"[guard] {reason}")
                 continue
@@ -342,6 +412,7 @@ class LLMPlayer:
             except SemanticError as exc:
                 stats.retries += 1
                 step.guard_blocked, step.block_reason, step.observation = True, "semantics", str(exc)
+                self._escalate(result, step, "illegal_args")
                 self._file(result, step)
                 self._append_turn(messages, call, f"[guard] {exc}")
                 continue
@@ -391,12 +462,17 @@ class LLMPlayer:
         if stats.fallback_used != "transport_failure":
             wanted = _WANTED.get(task, "night action")
             messages.append({"role": "user", "content": f"[guard] You are out of steps. Reply with exactly one `{wanted}` call now."})
-            response = self._call(messages, [t.openai_schema() for t in spec.tools], stats, kind="forced")
+            # the last chance of the turn goes to the strong model (cascade reason "forced")
+            marker = ReActStep(step_no + 1, action="<forced>")
+            self._escalate(result, marker, "forced")
+            marker.model = self._active().name if self.cascade is not None else None
+            response = self._call(messages, [t.openai_schema() for t in spec.tools], stats, kind="forced", result=result)
             if response is not None and response.tool_calls:
                 call = response.tool_calls[0]
                 term = spec.tool(call.name)
                 if term is not None and not call.malformed and term.check(call.arguments) is None:
-                    self._file(result, ReActStep(step_no + 1, action="<forced>", args=dict(call.arguments)))
+                    marker.args = dict(call.arguments)
+                    self._file(result, marker)
                     result.draft_attempt = self._take_attempt(call.name)
                     self._note(messages, result, stats)
                     return {"name": call.name, "args": term.normalise(call.arguments)}
@@ -432,7 +508,9 @@ class LLMPlayer:
         the ReAct chain. No tools are offered, so the reply is text. A failed or
         empty reply keeps the previous note rather than blanking it.
         """
-        response = self._call(messages + [{"role": "user", "content": NOTE_PROMPT}], None, stats, kind="note", scope=scope)
+        # The note is bookkeeping: under a cascade it is always the cheap model's job.
+        response = self._call(messages + [{"role": "user", "content": NOTE_PROMPT}], None, stats, kind="note", scope=scope,
+                              result=result, client=self.client)
         if gen != self._gen:
             return                                   # the turn it belonged to was thrown away
         if response is not None:
@@ -497,14 +575,39 @@ class LLMPlayer:
         return SpeechStream(on_text, self._abandon)
 
     # ------------------------------------------------------------ one model call, metered
+    def _active(self) -> LLMClient:
+        """The client this turn's next step goes to: the strong one once the turn escalated."""
+        return self.strong_client if self.cascade is not None and self._tier == "strong" else self.client
+
+    def _escalate(self, result: TurnResult, step: ReActStep | None, reason: str) -> bool:
+        """Move the rest of this turn to the strong model, if the policy says this reason does.
+
+        Called at every failure the loop sees; a no-op without a cascade, on the strong
+        tier already, or for a reason the policy does not escalate on. The transcript is
+        not touched here: whatever the caller appends next is what the strong model reads.
+        """
+        if self.cascade is None or self._tier != "cheap" or not self.cascade.escalates_on(reason):
+            return False
+        self._tier = "strong"
+        result.cascade["escalations"].append({"step": step.step if step is not None else None, "reason": reason,
+                                              "from": self.client.name, "to": self.strong_client.name})
+        if step is not None:
+            step.escalated = reason
+        return True
+
     def _call(self, messages: list[dict], schemas: list[dict] | None, stats: RecoveryStats, kind: str = "step",
-              scope: tuple | None = None):
+              scope: tuple | None = None, result: TurnResult | None = None, client: LLMClient | None = None):
         """Every model call goes through here so nothing is spent unmetered.
 
         The request is measured from the strings we are about to send, before it
         leaves; the reply is measured from what came back. The gateway's own
         counts are recorded beside ours and never used for the cap.
+
+        Under a cascade the call goes to the active tier (or to `client`), and is
+        written into the turn's `cascade.calls` with the model that answered it:
+        the cost of a game is per model, and the two tiers are not priced alike.
         """
+        client = client or self._active()
         sent = estimate_messages(messages, schemas)
         if self._open_attempt is not None:
             self._abandon("retry")                 # a new call means the last one's speech was not used
@@ -515,15 +618,21 @@ class LLMPlayer:
         seat, turn, task = scope or self._scope
         try:
             with call_scope(seat, turn, task, kind):
-                response = call_model(self.client, messages, schemas, policy=self.policy, stats=stats,
+                response = call_model(client, messages, schemas, policy=self.policy, stats=stats,
                                       temperature=self.temperature, max_tokens=self.max_tokens,
                                       on_delta=stream.feed if stream is not None else None, cancel=self.cancel)
         except Cancelled as exc:
-            exc.saved = savings(self.client.name, cost_kind, exc.produced, sent, note_pending=cost_kind != "note",
+            exc.saved = savings(client.name, cost_kind, exc.produced, sent, note_pending=cost_kind != "note",
                                 max_tokens=self.max_tokens)
             raise
         if response is not None:
-            expect_record(self.client.name, cost_kind, response.completion_tokens)
+            expect_record(client.name, cost_kind, response.completion_tokens)
+        if result is not None and result.cascade is not None:
+            result.cascade["calls"].append({
+                "kind": kind, "tier": "strong" if client is self.strong_client else "cheap", "model": client.name,
+                "prompt": getattr(response, "prompt_tokens", 0) or 0,
+                "completion": getattr(response, "completion_tokens", 0) or 0,
+                "ms": getattr(response, "latency_ms", 0) or 0, "ok": response is not None})
         if self.token_budget is not None:
             got = estimate_tokens(getattr(response, "text", "") or "")
             for call in getattr(response, "tool_calls", None) or []:
@@ -536,7 +645,7 @@ class LLMPlayer:
 
     # ------------------------------------------------------------ transcript
     def _append_turn(self, messages: list[dict], call: ToolCall, observation: str) -> None:
-        if getattr(self.client, "tool_mode", "native") == "native":
+        if getattr(self.client, "tool_mode", "native") == "native":    # both cascade tiers share it (__init__)
             messages.append({"role": "assistant", "content": None,
                              "tool_calls": [{"id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": call.raw_arguments or json.dumps(call.arguments)}}]})

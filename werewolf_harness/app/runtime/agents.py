@@ -223,6 +223,10 @@ def _run_agent_turn(job: AgentJob) -> AgentResult:
         meta.update({"prompt_tokens": last.prompt_tokens, "completion_tokens": last.completion_tokens,
                      "fallback_used": last.fallback_used, "steps": len(last.steps),
                      "trace": [s.to_dict() for s in last.steps][-8:]})
+        if getattr(last, "cascade", None) is not None:
+            # which model answered and why the turn escalated (players/llm/cascade.py)
+            meta["cascade"] = last.cascade
+            meta["model"] = last.model
         if forced and last.fallback_used == "transport_failure":
             # no model could answer this turn: decide by rule from the seat's own beliefs
             action = rule_action(job.task, job.spec, player.belief.snapshot())

@@ -320,6 +320,7 @@ class GameActor:
             for st in r.meta["trace"]:          # a worker in another process cannot stream steps; they come with the result
                 self.t.traces.setdefault(r.seat, []).append({**st, "round": getattr(self.t.env, "_round", 0)})
             self.t.traces[r.seat] = self.t.traces[r.seat][-40:]
+        self.t.note_cascade(r.meta)                # counted once, for the answer that is committed
         agent_states = [(r.seat, r.memory[0], r.memory[1])] if r.memory else []
         await self._commit(r.action, forced=r.forced, agent_states=agent_states, memory=(r.seat, r.memory),
                            draft=keep)

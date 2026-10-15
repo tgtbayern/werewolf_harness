@@ -146,6 +146,10 @@ class Hub:
             return MockClient.named(model, seed)
         if model in SIM_PROFILES:
             return SimClient(seed, name=model, cache=self.sim_cache, sleep=self.sim_sleep, **SIM_PROFILES[model])
+        from ...players.providers.mock import cascade_mock
+        offline = cascade_mock(model, seed)            # mock-strong / mock-flaky: a cascade's offline tiers
+        if offline is not None:
+            return offline
         from ...server.service import _client
         return _client(model, seed, self.env_keys)
 

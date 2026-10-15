@@ -68,6 +68,16 @@ python -m werewolf_harness.scripts.verify_replay   # 已结束的局逐一重放
 make up / make smoke / make down   # Docker 整套：双节点 + worker + Caddy + 监控；smoke 打一局 mock 并逐项检查
 ```
 
+模型级联（便宜模型打底，失败或关键回合换强模型；docs/adr/0014）：
+
+```
+python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku --strong claude-cli:sonnet --cascade both --out g.json
+python -m werewolf_harness.scripts.paired_cascade --seeds 2001-2010 --cheap claude-cli:haiku --strong claude-cli:sonnet \
+    --arms strong,cheap,cascade --record --out runs/cascade/     # 同种子配对：成本、升级原因、合法率、非劣效结论
+```
+
+在线服务用 `TableConfig.cascade = {"cheap": ..., "strong": ..., "mode": "on-fail|decisive|both"}`（`POST /api/games` 的 `cascade` 字段）。
+
 容器部署、CI 和验证记录见 `docs/deploy.md`。注意 `claude-cli` 座位只能在宿主机上跑（`cli serve`），容器里只有 mock / sim / API key 模型。
 
 旧的单进程服务还在：`python -m werewolf_harness.cli serve-legacy`（标准库 HTTP，无持久化）。
