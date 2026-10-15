@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,6 +26,7 @@ from typing import Any
 from ...arena import ActionSpec
 from ...players.budget import BudgetExhausted
 from ...players.llm.belief import BeliefState
+from ...players.providers.base import Cancelled, CancelToken
 from ...players.recovery import GatewayExhausted
 from .rules_npc import rule_action
 
@@ -42,6 +45,98 @@ class AgentJob:
     max_retries: int = 3
     lane: str = "online"                      # human (a person is waiting) | online | offline
     trace_ctx: Any = None                     # OpenTelemetry context of the turn span
+    # Streaming (docs/adr/0009): where draft messages go (None = this turn is not streamed),
+    # the token that stops the turn and its model call, and this execution's id -- a job
+    # can run twice (a worker died, the job was claimed again) and each run streams anew.
+    stream: bool = False                      # the executor wires `publish` for this job
+    publish: Callable[[Any], None] | None = None
+    cancel: CancelToken = field(default_factory=CancelToken)
+    run: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    job_id: str = ""                          # stable across runs (what a cancel names); defaults to run
+
+    def __post_init__(self):
+        self.job_id = self.job_id or self.run
+
+
+@dataclass
+class DraftMsg:
+    """A piece of a speech still being generated, or word that an attempt is void.
+
+    kind "delta":   `text` follows the first `offset` characters of this attempt
+    kind "abandon": this attempt will not be the turn's answer; `text` says why
+    Keyed by (seat, version, run, attempt): the actor turns that into a draft id.
+    """
+    game_id: str
+    seat: int
+    version: int
+    run: str
+    attempt: int
+    kind: str
+    offset: int = 0
+    text: str = ""
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+class DraftPump:
+    """The thread side of streaming: number fragments by offset and coalesce them.
+
+    A model streams a few tokens at a time; the table needs ~20 updates a second,
+    not one per token. Fragments are held for at most `interval` (a timer flushes
+    a held tail, so the last words of a speech never wait for the note call that
+    follows). An abandon flushes first, so nothing of an attempt arrives after
+    its abandon. Thread-safe: the model call and the timer both get here.
+    """
+
+    def __init__(self, job: AgentJob, send: Callable[[Any], None], interval: float = 0.05):
+        self.job, self.send, self.interval = job, send, interval
+        self._lock = threading.Lock()
+        self._sent: dict[int, int] = {}        # attempt -> characters sent
+        self._held: dict[int, list[str]] = {}
+        self._last = 0.0
+        self._timer: threading.Timer | None = None
+        self.messages = 0
+
+    def __call__(self, kind: str, attempt: int, text: str) -> None:
+        with self._lock:
+            if kind == "delta":
+                self._held.setdefault(attempt, []).append(text)
+                if time.monotonic() - self._last >= self.interval:
+                    self._flush_locked()
+                elif self._timer is None:
+                    self._timer = threading.Timer(self.interval, self.flush)
+                    self._timer.daemon = True
+                    self._timer.start()
+            else:
+                self._flush_locked()
+                self._emit(DraftMsg(self.job.game_id, self.job.seat, self.job.version, self.job.run, attempt,
+                                    "abandon", self._sent.get(attempt, 0), text))
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        for attempt, parts in list(self._held.items()):
+            text = "".join(parts)
+            if text:
+                off = self._sent.get(attempt, 0)
+                self._sent[attempt] = off + len(text)
+                self._emit(DraftMsg(self.job.game_id, self.job.seat, self.job.version, self.job.run, attempt,
+                                    "delta", off, text))
+        self._held.clear()
+        self._last = time.monotonic()
+
+    def _emit(self, msg: DraftMsg) -> None:
+        self.messages += 1
+        try:
+            self.send(msg)
+        except Exception:                                  # noqa: BLE001 -- a watcher must never break a turn
+            pass
 
 
 @dataclass
@@ -78,6 +173,11 @@ def _run_agent_turn(job: AgentJob) -> AgentResult:
     t0 = time.monotonic()
     player = job.make_player(job.on_step)
     llm = hasattr(player, "belief")
+    pump = DraftPump(job, job.publish) if job.publish is not None and hasattr(player, "on_draft") else None
+    if hasattr(player, "cancel"):
+        player.cancel = job.cancel
+    if pump is not None:
+        player.on_draft = pump
     if llm:
         n = job.view.get("num_players") or 12
         player.belief = BeliefState(job.view["you"], list(range(1, n + 1)))
@@ -88,17 +188,34 @@ def _run_agent_turn(job: AgentJob) -> AgentResult:
     feedback = None
     try:
         for _ in range(job.max_retries):
+            job.cancel.raise_if()
             action = player.act(job.view, job.task, job.spec, feedback)
             reason = job.spec.check(action)
             if reason is None:
                 forced = bool(getattr(player, "last_forced", False))
                 break
             feedback = reason
+            if pump is not None:
+                player.abandon_draft(getattr(player.last_turn, "draft_attempt", None), "spec")
         else:
             action, forced = job.spec.fallback, True
     except (BudgetExhausted, GatewayExhausted) as exc:
+        if pump is not None:
+            pump.flush()
         return AgentResult(job.game_id, job.seat, job.version, None, True, error=f"{type(exc).__name__}: {exc}")
-    meta: dict = {"ms": int((time.monotonic() - t0) * 1000)}
+    except Cancelled as exc:
+        # Nobody wants this turn any more (its deadline fired, the game stopped, the turn
+        # is gone). What it would still have cost is estimated for the ledger (adr/0009).
+        if pump is not None:
+            pump.flush()
+        saved = getattr(exc, "saved", None) or {"cut": 0, "skipped": 0, "total": 0, "produced": exc.produced}
+        return AgentResult(job.game_id, job.seat, job.version, None, True,
+                           meta={"cancelled": exc.reason, "tokens_saved": saved, "run": job.run,
+                                 "ms": int((time.monotonic() - t0) * 1000)})
+    meta: dict = {"ms": int((time.monotonic() - t0) * 1000), "run": job.run}
+    if pump is not None:
+        pump.flush()
+        meta["draft_attempt"] = getattr(getattr(player, "last_turn", None), "draft_attempt", None)
     last = getattr(player, "last_turn", None)
     if last is not None:
         meta.update({"prompt_tokens": last.prompt_tokens, "completion_tokens": last.completion_tokens,
@@ -108,6 +225,7 @@ def _run_agent_turn(job: AgentJob) -> AgentResult:
             # no model could answer this turn: decide by rule from the seat's own beliefs
             action = rule_action(job.task, job.spec, player.belief.snapshot())
             meta["rule_npc"] = True
+            meta["draft_attempt"] = None
     memory = (player.belief.snapshot(), player.note) if llm else None
     return AgentResult(job.game_id, job.seat, job.version, action, forced, memory, meta)
 
@@ -120,9 +238,15 @@ class LocalExecutor:
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agent")
         self.inflight = 0
 
+    def cancel(self, job: AgentJob, reason: str) -> None:
+        """Stop a turn in flight: the model call is cut where it stands (see CancelToken)."""
+        job.cancel.cancel(reason)
+
     def submit(self, job: AgentJob, deliver: Callable[[AgentResult], None]) -> None:
         loop = asyncio.get_running_loop()
         self.inflight += 1
+        if job.publish is None and getattr(job, "stream", False):
+            job.publish = deliver                 # drafts ride the same mailbox, so they precede the result
         fut = loop.run_in_executor(self.pool, run_agent_turn, job)
 
         def done(f: asyncio.Future) -> None:

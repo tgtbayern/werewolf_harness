@@ -26,8 +26,8 @@ from dataclasses import dataclass
 import redis as redis_sync
 
 from ...players.budget import BudgetExhausted, estimate_messages
-from ...players.providers.base import LLMClient, LLMResponse, ProviderError
-from ...players.providers.mock import MockClient
+from ...players.providers.base import Cancelled, CancelToken, Delta, LLMClient, LLMResponse, ProviderError, collect
+from ...players.providers.mock import STREAM_PROFILES, MockClient
 from ...players.recovery import is_terminal_refusal
 from ..obs import logging as olog
 from ..obs import metrics
@@ -107,6 +107,9 @@ SIM_PROFILES = {
     "sim-flaky": {"median_ms": 800, "timeout_rate": 0.3, "error_rate": 0.2},
     "sim-down": {"median_ms": 0, "error_rate": 1.0},
     "sim-fast": {"median_ms": 0},
+    # Timed like a real model for the streaming benchmark: ~1 s to the first token,
+    # 45 tokens/s, 400-token speeches (docs/adr/0009).
+    "sim-stream": {"median_ms": 1000, "sigma": 0.25, "tokens_per_s": 45.0, "speech_tokens": 400},
 }
 
 
@@ -135,8 +138,8 @@ class Hub:
             return self._breakers[name]
 
     def raw_client(self, model: str, seed: int) -> LLMClient:
-        if model == "mock":
-            return MockClient(seed=seed)
+        if model == "mock" or model in STREAM_PROFILES:
+            return MockClient.named(model, seed)
         if model in SIM_PROFILES:
             return SimClient(seed, name=model, cache=self.sim_cache, sleep=self.sim_sleep, **SIM_PROFILES[model])
         from ...server.service import _client
@@ -164,6 +167,21 @@ class GatewayClient(LLMClient):
         self.hub.sink.put(CallRecord(self.game_id, self.seat, self.seq, model, _provider(model), status, **kw))
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+        return collect(self._run(messages, tools, temperature, max_tokens, timeout, stream=False, cancel=None))
+
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0,
+                    cancel: CancelToken | None = None):
+        """The same chain, streaming from whichever model answers.
+
+        A model that fails after it has started streaming is followed by a
+        ``reset`` fragment before the next model is tried: what was shown came
+        from a reply that will not be used. A cancelled call is not a failure --
+        it is recorded as ``cancelled``, charged for what it used, and no other
+        model is tried.
+        """
+        yield from self._run(messages, tools, temperature, max_tokens, timeout, stream=True, cancel=cancel)
+
+    def _run(self, messages, tools, temperature, max_tokens, timeout, *, stream: bool, cancel: CancelToken | None):
         if self.game_id and self.max_game_tokens and self.hub.budget.spent(self.game_id) >= self.max_game_tokens:
             raise BudgetExhausted(f"game {self.game_id} spent its {self.max_game_tokens} tokens")
         est = estimate_messages(messages, tools)
@@ -186,9 +204,37 @@ class GatewayClient(LLMClient):
             span = get_tracer().start_span(f"chat {model}", attributes={
                 "gen_ai.operation.name": "chat", "gen_ai.system": _provider(model), "gen_ai.request.model": model,
                 "gen_ai.request.max_tokens": max_tokens, "game.id": self.game_id or "", "game.seat": self.seat or 0,
-                "llm.fallback_index": i})
+                "llm.fallback_index": i, "llm.stream": stream})
+            streamed = False
             try:
-                resp = client.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens, timeout=timeout)
+                if stream:
+                    resp = None
+                    for item in client.chat_stream(messages, tools=tools, temperature=temperature,
+                                                   max_tokens=max_tokens, timeout=timeout, cancel=cancel):
+                        if isinstance(item, LLMResponse):
+                            resp = item
+                        else:
+                            streamed = True
+                            yield item
+                    if resp is None:
+                        raise ProviderError(f"{model}: stream ended without a response", status=502)
+                else:
+                    resp = client.chat(messages, tools=tools, temperature=temperature, max_tokens=max_tokens,
+                                       timeout=timeout)
+            except Cancelled as exc:
+                # Not the provider's fault: no breaker, no fallback. The prompt was sent and
+                # `produced` tokens were generated before the plug was pulled -- that is billed.
+                span.set_attribute("llm.cancelled", exc.reason)
+                span.end()
+                used = est + exc.produced
+                pipe = self.hub.r.pipeline(transaction=False)
+                self.hub.limiter.settle(model, want, used, pipe=pipe)
+                if self.game_id:
+                    self.hub.budget.add(self.game_id, used, pipe=pipe)
+                pipe.execute()
+                self._record(model, "cancelled", input_tokens=est, output_tokens=exc.produced,
+                             latency_ms=int((time.monotonic() - t0) * 1000), fallback_reason=exc.reason[:60])
+                raise
             except ProviderError as exc:
                 span.set_attribute("error.type", classify(exc) or "client_error")
                 span.set_status(_err_status(str(exc)))
@@ -210,38 +256,43 @@ class GatewayClient(LLMClient):
                 reason = reason or why
                 self._record(model, "timeout" if why == "timeout" else "error", latency_ms=ms, fallback_reason=why)
                 metrics.LLM_CALL_MS.labels(model=model, status="error").observe(ms)
+                if streamed:
+                    yield Delta("reset")                   # what was shown came from a reply nobody will use
                 continue
-            ms = int((time.monotonic() - t0) * 1000)
-            cached_now = cached_tokens_of(resp)
-            span.set_attribute("gen_ai.usage.input_tokens", resp.prompt_tokens)
-            span.set_attribute("gen_ai.usage.output_tokens", resp.completion_tokens)
-            span.set_attribute("gen_ai.usage.cached_input_tokens", cached_now)
-            if reason:
-                span.set_attribute("llm.fallback_reason", reason)
-            span.end()
-            br.record(True)
-            metrics.BREAKER_STATE.labels(provider=model).set(1 if br.state == "open" else 0)
-            cached = cached_tokens_of(resp)
-            used = resp.prompt_tokens + resp.completion_tokens
-            # settle the reservation and charge the game in one round trip
-            pipe = self.hub.r.pipeline(transaction=False)
-            self.hub.limiter.settle(model, want, used, pipe=pipe)
-            if self.game_id:
-                self.hub.budget.add(self.game_id, used, pipe=pipe)
-            pipe.execute()
-            usd = pricing.cost(model, resp.prompt_tokens, cached, resp.completion_tokens)
-            fb = reason if i > 0 else None
-            self._record(model, "ok", input_tokens=resp.prompt_tokens, cached_tokens=cached,
-                         output_tokens=resp.completion_tokens, latency_ms=ms, cost_usd=usd, fallback_reason=fb)
-            metrics.LLM_CALL_MS.labels(model=model, status="ok").observe(ms)
-            metrics.LLM_TOKENS.labels(model=model, kind="input").inc(resp.prompt_tokens)
-            metrics.LLM_TOKENS.labels(model=model, kind="cached").inc(cached)
-            metrics.LLM_TOKENS.labels(model=model, kind="output").inc(resp.completion_tokens)
-            metrics.LLM_COST.labels(model=model).inc(usd)
-            if fb:
-                metrics.LLM_FALLBACKS.labels(reason=fb).inc()
-            return resp
+            yield self._settle(model, resp, want, t0, span, reason if i > 0 else None, reason, br)
+            return
         raise ProviderError(f"every model in the chain failed ({reason})", status=503)
+
+    def _settle(self, model: str, resp: LLMResponse, want: int, t0: float, span, fb: str | None,
+                reason: str | None, br: Breaker) -> LLMResponse:
+        ms = int((time.monotonic() - t0) * 1000)
+        cached = cached_tokens_of(resp)
+        span.set_attribute("gen_ai.usage.input_tokens", resp.prompt_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", resp.completion_tokens)
+        span.set_attribute("gen_ai.usage.cached_input_tokens", cached)
+        if reason:
+            span.set_attribute("llm.fallback_reason", reason)
+        span.end()
+        br.record(True)
+        metrics.BREAKER_STATE.labels(provider=model).set(1 if br.state == "open" else 0)
+        used = resp.prompt_tokens + resp.completion_tokens
+        # settle the reservation and charge the game in one round trip
+        pipe = self.hub.r.pipeline(transaction=False)
+        self.hub.limiter.settle(model, want, used, pipe=pipe)
+        if self.game_id:
+            self.hub.budget.add(self.game_id, used, pipe=pipe)
+        pipe.execute()
+        usd = pricing.cost(model, resp.prompt_tokens, cached, resp.completion_tokens)
+        self._record(model, "ok", input_tokens=resp.prompt_tokens, cached_tokens=cached,
+                     output_tokens=resp.completion_tokens, latency_ms=ms, cost_usd=usd, fallback_reason=fb)
+        metrics.LLM_CALL_MS.labels(model=model, status="ok").observe(ms)
+        metrics.LLM_TOKENS.labels(model=model, kind="input").inc(resp.prompt_tokens)
+        metrics.LLM_TOKENS.labels(model=model, kind="cached").inc(cached)
+        metrics.LLM_TOKENS.labels(model=model, kind="output").inc(resp.completion_tokens)
+        metrics.LLM_COST.labels(model=model).inc(usd)
+        if fb:
+            metrics.LLM_FALLBACKS.labels(reason=fb).inc()
+        return resp
 
 
 def _err_status(msg: str):
@@ -250,7 +301,7 @@ def _err_status(msg: str):
 
 
 def _provider(model: str) -> str:
-    if model in ("mock", "script") or model.startswith("sim"):
+    if model in ("mock", "script") or model.startswith("sim") or model.startswith("mock-"):
         return "local"
     if model == "claude-cli" or model.startswith("claude-cli:"):
         return "Claude Code CLI"

@@ -16,6 +16,9 @@ How it maps onto the LLMClient contract:
              Claude Code's own tools are all switched off (--tools "").
   usage      read from the CLI's JSON result: input + cache writes + cache reads
              is the prompt, output is the completion.
+  streaming  chat_stream runs --output-format stream-json --include-partial-messages
+             --verbose and yields each text_delta as it is printed; cancelling the
+             call kills the process (see StreamJsonParser for the lines it reads).
   failures   mapped onto the statuses the gateway already classifies: not
              installed / not logged in -> 401 (terminal), usage or rate limit ->
              429, timeout -> transport, anything else -> 502.
@@ -53,7 +56,7 @@ import tempfile
 import threading
 import time
 
-from .base import (JSON_TOOL_INSTRUCTIONS, LLMClient, LLMResponse, ProviderError,
+from .base import (JSON_TOOL_INSTRUCTIONS, Cancelled, CancelToken, Delta, LLMClient, LLMResponse, ProviderError,
                    describe_tools_for_prompt, parse_json_action)
 
 PREFIX = "claude-cli"
@@ -152,8 +155,11 @@ class ClaudeCLIClient(LLMClient):
         self.lean = _setting("CLAUDE_CLI_LEAN", env, "1") not in ("0", "false", "no")
 
     # ------------------------------------------------------------ command line
-    def command(self, system: str) -> list[str]:
-        cmd = [self.binary, "-p", "--output-format", "json", "--no-session-persistence",
+    def command(self, system: str, stream: bool = False) -> list[str]:
+        # stream-json prints one event per line; --verbose is required with it in -p mode, and
+        # --include-partial-messages adds the token-level deltas (content_block_delta).
+        fmt = ["stream-json", "--verbose", "--include-partial-messages"] if stream else ["json"]
+        cmd = [self.binary, "-p", "--output-format", *fmt, "--no-session-persistence",
                "--tools", "", "--strict-mcp-config", "--max-turns", "1", "--system-prompt", system]
         if self.cli_model:
             cmd += ["--model", self.cli_model]
@@ -174,30 +180,104 @@ class ClaudeCLIClient(LLMClient):
             env["ANTHROPIC_API_KEY"] = self.env["ANTHROPIC_API_KEY"]
         return env
 
+    def _acquire(self, timeout: float, started: float) -> float:
+        if not self.slots.acquire(timeout=timeout):
+            raise ProviderError(f"{self.model}: all {self.slots._initial_value} CLI slots busy for {timeout:.0f}s",
+                                status=429, hint="raise CLAUDE_CLI_CONCURRENCY or seat fewer claude-cli players")
+        return max(1.0, timeout - (time.time() - started))
+
     # ------------------------------------------------------------ chat
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
         system = system_prompt(messages, tools)
         prompt = render_transcript(messages)
         started = time.time()
-        if not self.slots.acquire(timeout=timeout):
-            raise ProviderError(f"{self.model}: all {self.slots._initial_value} CLI slots busy for {timeout:.0f}s",
-                                status=429, hint="raise CLAUDE_CLI_CONCURRENCY or seat fewer claude-cli players")
+        remaining = self._acquire(timeout, started)
         try:
-            remaining = max(1.0, timeout - (time.time() - started))
             try:
                 proc = subprocess.run(self.command(system), input=prompt, capture_output=True, text=True,
                                       timeout=remaining, cwd=self.cwd, env=self._env())
             except FileNotFoundError as exc:
-                raise ProviderError(f"claude CLI not found: {self.binary!r}", status=401,
-                                    hint="install Claude Code and sign in (`claude`), or set CLAUDE_CLI_BIN") from exc
+                raise self._not_found() from exc
             except subprocess.TimeoutExpired as exc:
-                raise ProviderError(f"{self.model}: claude -p timed out after {remaining:.0f}s",
-                                    hint="the CLI did not answer in time; retried on the next model") from exc
+                raise self._timed_out(remaining) from exc
         finally:
             self.slots.release()
-        latency_ms = int((time.time() - started) * 1000)
         data = self._parse(proc)
+        return self._response(data, tools, int((time.time() - started) * 1000))
 
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0,
+                    cancel: CancelToken | None = None):
+        """`claude -p --output-format stream-json --include-partial-messages`, read line by line.
+
+        Each text_delta is yielded as it is printed. Cancelling kills the process
+        (and with it the request the CLI has open), so a turn whose deadline fired
+        stops costing tokens at once. The final `result` line is read exactly as
+        the one-shot JSON output is, so usage, errors and statuses are identical.
+        """
+        cancel = cancel or CancelToken()
+        cancel.raise_if()
+        system = system_prompt(messages, tools)
+        prompt = render_transcript(messages)
+        started = time.time()
+        remaining = self._acquire(timeout, started)
+        proc = None
+        try:
+            try:
+                proc = subprocess.Popen(self.command(system, stream=True), stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.cwd, env=self._env())
+            except FileNotFoundError as exc:
+                raise self._not_found() from exc
+            err: list[bytes] = []
+            threading.Thread(target=_feed_stdin, args=(proc, prompt), daemon=True).start()
+            drain = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+            drain.start()
+            timed_out = threading.Event()
+
+            def deadline():
+                timed_out.set()
+                _kill(proc)
+            timer = threading.Timer(remaining, deadline)
+            timer.daemon = True
+            timer.start()
+            unhook = cancel.on_cancel(lambda: _kill(proc))
+            parser = StreamJsonParser()
+            out: list[str] = []
+            try:
+                for raw in proc.stdout:
+                    for d in parser.feed(raw.decode("utf-8", errors="replace")):
+                        out.append(d.text)
+                        yield d
+                proc.wait()
+            finally:
+                timer.cancel()
+                unhook()
+            drain.join(2.0)
+            if cancel.is_set():
+                from ..budget import estimate_tokens
+                raise Cancelled(cancel.reason or "cancelled", estimate_tokens("".join(out)))
+            if timed_out.is_set():
+                raise self._timed_out(remaining)
+            stdout = json.dumps(parser.result) if parser.result is not None else ""
+            data = self._parse(subprocess.CompletedProcess(proc.args, proc.returncode, stdout,
+                                                           b"".join(err).decode("utf-8", errors="replace")),
+                               fallback_text=parser.text())
+            for d in parser.tail():
+                yield d                                    # a CLI that printed no partials: the whole text once
+        finally:
+            if proc is not None and proc.poll() is None:
+                _kill(proc)                                # the consumer walked away: do not leave it running
+            self.slots.release()
+        yield self._response(data, tools, int((time.time() - started) * 1000))
+
+    def _not_found(self) -> ProviderError:
+        return ProviderError(f"claude CLI not found: {self.binary!r}", status=401,
+                             hint="install Claude Code and sign in (`claude`), or set CLAUDE_CLI_BIN")
+
+    def _timed_out(self, remaining: float) -> ProviderError:
+        return ProviderError(f"{self.model}: claude -p timed out after {remaining:.0f}s",
+                             hint="the CLI did not answer in time; retried on the next model")
+
+    def _response(self, data: dict, tools, latency_ms: int) -> LLMResponse:
         usage = data.get("usage") or {}
         cache_read = int(usage.get("cache_read_input_tokens") or 0)
         cache_write = int(usage.get("cache_creation_input_tokens") or 0)
@@ -220,7 +300,7 @@ class ClaudeCLIClient(LLMClient):
             response.tool_calls.append(parse_json_action(text))   # malformed calls are reported by the loop
         return response
 
-    def _parse(self, proc: subprocess.CompletedProcess) -> dict:
+    def _parse(self, proc: subprocess.CompletedProcess, fallback_text: str = "") -> dict:
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
         data: dict = {}
@@ -229,6 +309,8 @@ class ClaudeCLIClient(LLMClient):
                 data = json.loads(out.splitlines()[-1] if not out.startswith("{") else out)
             except json.JSONDecodeError:
                 data = {}
+        if not data and fallback_text and proc.returncode == 0:
+            data = {"result": fallback_text}               # a stream that ended without its result line
         failed = proc.returncode != 0 or not data or data.get("is_error") or data.get("subtype") not in (None, "success")
         if not failed:
             return data
@@ -242,3 +324,79 @@ class ClaudeCLIClient(LLMClient):
             raise ProviderError(f"{self.model}: rate limit / usage limit: {detail}", status=429,
                                 hint="the subscription or key hit its limit; seats move to the next model")
         raise ProviderError(f"{self.model}: {detail}", status=int(status) if isinstance(status, int) else 502)
+
+
+class StreamJsonParser:
+    """`claude -p --output-format stream-json` lines -> text fragments and the result.
+
+    The lines this reads (Claude Code 2.x, with --verbose --include-partial-messages):
+
+      {"type": "system", "subtype": "init", ...}                       ignored
+      {"type": "stream_event", "event": {"type": "content_block_delta",
+          "index": 0, "delta": {"type": "text_delta", "text": "..."}}}  -> a text fragment
+      {"type": "stream_event", "event": {... "thinking_delta" ...}}     ignored: private reasoning
+      {"type": "assistant", "message": {"content": [{"type": "text", ...}]}}
+                                                                        the whole message, kept as a fallback
+      {"type": "result", "subtype": "success", "result": "...", "usage": {...}}
+                                                                        the same object --output-format json prints
+
+    Tolerant on purpose: an unknown line type, a line that is not JSON (a warning
+    on stdout) or an event without the fields above is skipped, and a CLI that
+    prints no partial deltas still yields its reply -- once, from the assistant
+    message, at the end (`tail()`).
+    """
+
+    def __init__(self):
+        self.result: dict | None = None
+        self._parts: list[str] = []
+        self._whole: list[str] = []
+        self._streamed = False
+
+    def feed(self, line: str) -> list[Delta]:
+        line = line.strip()
+        if not line.startswith("{"):
+            return []
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        kind = obj.get("type")
+        if kind == "stream_event":
+            ev = obj.get("event") or {}
+            if ev.get("type") == "content_block_delta":
+                d = ev.get("delta") or {}
+                if d.get("type") == "text_delta" and d.get("text"):
+                    self._streamed = True
+                    self._parts.append(d["text"])
+                    return [Delta("text", d["text"])]
+            return []
+        if kind == "assistant":
+            for block in (obj.get("message") or {}).get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    self._whole.append(block["text"])
+        elif kind == "result":
+            self.result = obj
+        return []
+
+    def text(self) -> str:
+        return "".join(self._parts) if self._streamed else "".join(self._whole)
+
+    def tail(self) -> list[Delta]:
+        if self._streamed or not self._whole:
+            return []
+        return [Delta("text", "".join(self._whole))]
+
+
+def _feed_stdin(proc: subprocess.Popen, prompt: str) -> None:
+    try:
+        proc.stdin.write(prompt.encode("utf-8"))
+        proc.stdin.close()
+    except (BrokenPipeError, OSError, ValueError):
+        pass                                               # it died (or was killed) before reading it all
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass

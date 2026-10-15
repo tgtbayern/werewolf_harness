@@ -25,7 +25,7 @@ import threading
 import time
 from collections import OrderedDict
 
-from ...players.providers.base import LLMClient, LLMResponse, ProviderError
+from ...players.providers.base import Cancelled, CancelToken, LLMClient, LLMResponse, ProviderError
 from ...players.providers.mock import MockClient
 
 CHARS_PER_TOKEN = 4
@@ -85,9 +85,14 @@ class SimClient(LLMClient):
 
     def __init__(self, seed: int = 0, *, name: str = "sim", median_ms: float = 0.0, sigma: float = 0.6,
                  timeout_rate: float = 0.0, error_rate: float = 0.0, rate_limit_rate: float = 0.0,
-                 cache: PrefixCache | None = None, tools_first: bool = True, sleep: bool = True):
+                 cache: PrefixCache | None = None, tools_first: bool = True, sleep: bool = True,
+                 tokens_per_s: float = 0.0, speech_tokens: int = 0, chunk_tokens: float = 4.0):
         self.name = name
-        self.inner = MockClient(seed=seed)
+        # The sampled latency is the time to the first token; with tokens_per_s the reply
+        # then takes as long to generate as a real one would (and streams at that rate).
+        self.tokens_per_s = tokens_per_s if sleep else 0.0
+        self.inner = MockClient(seed=seed, tokens_per_s=self.tokens_per_s, speech_tokens=speech_tokens,
+                                chunk_tokens=chunk_tokens)
         self.rng = random.Random(seed * 7919 + 1)
         self.median_ms, self.sigma = median_ms, sigma
         self.timeout_rate, self.error_rate, self.rate_limit_rate = timeout_rate, error_rate, rate_limit_rate
@@ -95,7 +100,8 @@ class SimClient(LLMClient):
         self.tools_first = tools_first
         self.sleep = sleep
 
-    def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+    def _fault(self, timeout: float) -> float:
+        """Roll the dice for this call: raise its fault, or return its latency in ms."""
         r = self.rng.random()
         if r < self.timeout_rate:
             if self.sleep:
@@ -105,15 +111,32 @@ class SimClient(LLMClient):
             raise ProviderError(f"{self.name}: 429 rate limited", status=429)
         if r < self.timeout_rate + self.rate_limit_rate + self.error_rate:
             raise ProviderError(f"{self.name}: 503 upstream error", status=503)
-        ms = self.median_ms * math.exp(self.rng.gauss(0, self.sigma)) if self.median_ms else 0.0
-        if self.sleep and ms:
-            time.sleep(ms / 1000)
-        resp = self.inner.chat(messages, tools, temperature, max_tokens, timeout)
+        return self.median_ms * math.exp(self.rng.gauss(0, self.sigma)) if self.median_ms else 0.0
+
+    def _account(self, resp: LLMResponse, messages, tools, ms: float) -> LLMResponse:
         prompt, cached = (self.cache.lookup_and_fill(serialise(messages, tools, self.tools_first))
                           if self.cache else (resp.prompt_tokens, 0))
         resp.prompt_tokens = prompt
-        resp.latency_ms = int(ms)
+        resp.latency_ms = int(ms) + (resp.latency_ms if self.tokens_per_s else 0)
         resp.model = self.name
         resp.raw = {"usage": {"prompt_tokens": prompt, "completion_tokens": resp.completion_tokens,
                               "prompt_tokens_details": {"cached_tokens": cached}}}
         return resp
+
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+        ms = self._fault(timeout)
+        if self.sleep and ms:
+            time.sleep(ms / 1000)
+        resp = self.inner.chat(messages, tools, temperature, max_tokens, timeout)
+        return self._account(resp, messages, tools, ms)
+
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0,
+                    cancel: CancelToken | None = None):
+        """Same faults and latency as chat(); the sampled latency is the wait for the first token."""
+        cancel = cancel or CancelToken()
+        cancel.raise_if()
+        ms = self._fault(timeout)
+        if self.sleep and ms and cancel.wait(ms / 1000):
+            raise Cancelled(cancel.reason or "cancelled", 0)
+        for item in self.inner.chat_stream(messages, tools, temperature, max_tokens, timeout, cancel=cancel):
+            yield self._account(item, messages, tools, ms) if isinstance(item, LLMResponse) else item

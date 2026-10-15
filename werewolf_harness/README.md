@@ -53,6 +53,7 @@ python -m werewolf_harness.cli play --variant 8p --model claude-cli:haiku
 | 模型任务队列 | Redis Streams：三条优先级流、至少一次投递、XAUTOCLAIM 认领、死信 | ADR 0005 |
 | 局不卡死 | 所有模型都失败时，规则座位按信念表出手 | `app/runtime/rules_npc.py` |
 | 实时通信 | WebSocket（心跳、断线按 `last_seq` 续传、单连接令牌桶）+ 观战用 SSE | `app/api/main.py` |
+| 流式发言 | 模型发言边生成边显示为草稿（「正在说…」）；草稿要么提交时换成 journal 里的原文，要么明确撤回；超时、停局时取消上游调用 | ADR 0009 |
 | 座位隐私 | 游客 JWT + seat token；公共事件去掉夜间行动者和 `thought` | ADR 0007 |
 | 排行榜 | Redis ZSET（同分按先到者排前）；模型按阵营统计胜率 | `app/api/leaderboard.py` |
 | 可观测 | Prometheus 指标 + Grafana 看板；OpenTelemetry：turn → invoke_agent → chat，跨线程、跨进程 | `app/obs/` |

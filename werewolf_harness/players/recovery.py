@@ -23,7 +23,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .providers.base import ProviderError
+from .providers.base import Cancelled, CancelToken, Delta, ProviderError, collect
 
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
@@ -128,21 +128,56 @@ class RecoveryStats:
 
 
 def call_model(client, messages, tools, *, policy: RecoveryPolicy, stats: RecoveryStats,
-               temperature: float, max_tokens: int):
+               temperature: float, max_tokens: int, on_delta=None, cancel: CancelToken | None = None):
     """One model call, with bounded retries on transport-level failures.
 
     Returns None when every attempt failed; the caller then falls back to the
     conservative default for the turn rather than propagating an exception.
+
+    With `on_delta` or `cancel` the call goes through `chat_stream`: fragments go
+    to `on_delta` as they arrive (a ``reset`` fragment precedes a retry that
+    follows a partly streamed attempt), and `cancel` stops the call mid-flight.
+    Each attempt runs on a child of `cancel`, so the hard deadline below pulls
+    the plug on that one call -- kills the `claude -p` process, shuts the socket
+    -- instead of only walking away from its thread. Cancelled is raised, never
+    retried: nobody wants the answer any more.
     """
     delay = policy.backoff_s
+    streaming = on_delta is not None or cancel is not None
     for attempt in range(policy.max_transport_retries + 1):
+        sent = {"any": False}
+
+        def relay(d, _sent=sent):
+            _sent["any"] = True
+            on_delta(d)
+
+        call_cancel = cancel.child() if cancel is not None else CancelToken()
         try:
-            return _with_deadline(
-                lambda: client.chat(messages, tools=tools, temperature=temperature,
-                                    max_tokens=max_tokens, timeout=policy.timeout_s),
-                policy.timeout_s * 1.5 + 5,
-            )
+            if streaming:
+                fn = lambda: collect(client.chat_stream(messages, tools=tools, temperature=temperature,  # noqa: E731
+                                                        max_tokens=max_tokens, timeout=policy.timeout_s,
+                                                        cancel=call_cancel), relay if on_delta else None)
+            else:
+                fn = lambda: client.chat(messages, tools=tools, temperature=temperature,  # noqa: E731
+                                         max_tokens=max_tokens, timeout=policy.timeout_s)
+            return _with_deadline(fn, policy.timeout_s * 1.5 + 5, cancel=call_cancel)
+        except Cancelled:
+            if cancel is not None and cancel.is_set():
+                raise
+            # only this call's own deadline fired: a transport timeout like any other
+            stats.errors.append("model call cancelled at its hard deadline")
+            stats.timeouts = True
+            if sent["any"] and on_delta is not None:
+                on_delta(Delta("reset"))
+            if attempt == policy.max_transport_retries:
+                return None
+            stats.transport_retries += 1
+            policy.sleep(delay)
+            delay *= 2
+            continue
         except ProviderError as exc:
+            if sent["any"] and on_delta is not None:
+                on_delta(Delta("reset"))
             stats.errors.append(str(exc)[:200])
             # Money, key and quota are not weather. Retrying one of these buys
             # nothing and the fallback that follows it silently replaces the
@@ -182,18 +217,29 @@ _POOL = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("MO
                                               thread_name_prefix="model-call")
 
 
-def _with_deadline(fn, seconds: float):
+def _with_deadline(fn, seconds: float, cancel: CancelToken | None = None):
     """Run one model call under a hard wall-clock deadline.
 
     A socket timeout is per read: a relay that trickles keep-alive bytes never
     trips it, and one game sat on a single call for two hours. The call runs in
-    a worker thread; past the deadline the thread is abandoned (it dies with
-    its socket) and the turn is treated as a transport timeout.
+    a worker thread; past the deadline `cancel` is pulled (a streaming client
+    kills its process or shuts its socket) and the turn is treated as a
+    transport timeout. A cancel from outside is noticed within 0.1 s even when
+    the client cannot be interrupted: the thread is abandoned, the caller is not.
     """
     # carry the caller's contextvars (trace context, log fields) into the pool thread
     future = _POOL.submit(contextvars.copy_context().run, fn)
-    try:
-        return future.result(timeout=seconds)
-    except concurrent.futures.TimeoutError as exc:
-        future.cancel()
-        raise ProviderError(f"model call timed out after {seconds:.0f}s (hard deadline)", status=None) from exc
+    end = time.monotonic() + seconds
+    while True:
+        try:
+            return future.result(timeout=0.1 if cancel is not None else seconds)
+        except concurrent.futures.TimeoutError as exc:
+            if cancel is not None and cancel.is_set():
+                future.cancel()
+                raise Cancelled(cancel.reason or "cancelled") from exc
+            if time.monotonic() < end and cancel is not None:
+                continue
+            future.cancel()
+            if cancel is not None:
+                cancel.cancel("deadline")
+            raise ProviderError(f"model call timed out after {seconds:.0f}s (hard deadline)", status=None) from exc

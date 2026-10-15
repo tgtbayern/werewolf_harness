@@ -24,6 +24,7 @@ from ..config import Settings, get_settings
 from ..obs import logging as olog
 from ..obs import metrics, tracing
 from ..runtime.actor import ActorHooks
+from ..runtime.drafts import outbox
 from ..runtime.runtime import Runtime
 from ..runtime.table import Table, TableConfig
 from ..storage import Store, migrate
@@ -77,7 +78,7 @@ def build_runtime(settings: Settings, store: Store, redis: Redis, env_keys: dict
     return rt
 
 
-LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky"]
+LOCAL_MODELS = ["mock", "script", "sim", "sim-strong", "sim-cheap", "sim-flaky", "mock-stream", "sim-stream"]
 
 
 def _playable(env_keys: dict) -> list[str]:
@@ -355,21 +356,28 @@ def _routes(app: FastAPI) -> None:
         return FastJSON(await a.submit(seat, int(body["seq"]), body["action"], body.get("request_id")))
 
     @app.get("/api/games/{gid}/events")
-    async def sse(request: Request, gid: str, after: int = 0):
-        """Spectators: the public event stream (no night actors, no thoughts)."""
+    async def sse(request: Request, gid: str, after: int = 0, drafts: bool = False, epoch: int | None = None,
+                  dseq: int = -1):
+        """Spectators: the public event stream (no night actors, no thoughts). With ?drafts=1 also
+        the public drafts, as `event: draft` messages (an EventSource's onmessage never sees them).
+        Resume with ?after=<next seq>&drafts=1&epoch=<e>&dseq=<last dseq>."""
         a = _local(request, gid)
 
         async def gen():
-            cursor = after
+            cur = {"next": after, "epoch": epoch, "dlast": dseq, "known": {}}
             while True:
                 if await request.is_disconnected():
                     return
-                evs = await a.wait_events(cursor, timeout=15)
-                for e in evs:
-                    yield f"id: {e.seq}\ndata: {json.dumps(e.to_dict(), ensure_ascii=False, default=str)}\n\n"
-                    cursor = e.seq + 1
+                if drafts:
+                    await a.wait_any(cur["next"], cur["dlast"], timeout=15)
+                else:
+                    await a.wait_events(cur["next"], timeout=15)
+                    cur.update(epoch=a.t.draft_epoch, dlast=a.t.dseq - 1)     # skip drafts
+                for op, body in outbox(a.t, None, cur):
+                    data = json.dumps(body, ensure_ascii=False, default=str)
+                    yield f"id: {body['seq']}\ndata: {data}\n\n" if op == "event" else f"event: draft\ndata: {data}\n\n"
                 yield ": ping\n\n"
-                if a.stopped and cursor >= len(a.t.events):
+                if a.stopped and cur["next"] >= len(a.t.events):
                     return
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
@@ -392,15 +400,21 @@ def _routes(app: FastAPI) -> None:
 
     # ---------------------------------------------------------- websocket
     @app.websocket("/ws/games/{gid}")
-    async def ws(websocket: WebSocket, gid: str, token: str | None = None, last_seq: int = -1):
-        await _ws_session(websocket, gid, token, last_seq)
+    async def ws(websocket: WebSocket, gid: str, token: str | None = None, last_seq: int = -1,
+                 epoch: int | None = None, dseq: int = -1):
+        await _ws_session(websocket, gid, token, last_seq, epoch, dseq)
 
 
-async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_seq: int) -> None:
+async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_seq: int,
+                      epoch: int | None = None, dseq: int = -1) -> None:
     """One connection: hello, then two tasks -- push events, read client messages.
 
-        server -> hello{heartbeat_s} | event{seq,...} | pong | ack{request_id, result} | error
-        client -> ping | resume{last_seq} | act{seq, action, request_id}
+        server -> hello{heartbeat_s, draft_epoch, dseq} | event{seq,...} | draft{dseq, kind,...}
+                  | pong | ack{request_id, result} | error
+        client -> ping | resume{last_seq, epoch?, dseq?, drafts?: {id: offset}} | act{seq, action, request_id}
+
+    Drafts (docs/adr/0009) are filtered per reader by Table.draft_visible: a wolf
+    sees the pack's drafts, nobody else does.
 
     The client pings every heartbeat_s (the first one after a random fraction of
     it, so a restart does not bring every client back in the same second). Two
@@ -414,11 +428,12 @@ async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_se
         return
     seat = tokens.seat_of(s.s.jwt_secret, token, gid)
     metrics.WS_CONNECTIONS.inc()
-    cursor = {"next": max(0, last_seq + 1)}
+    cursor = {"next": max(0, last_seq + 1), "epoch": epoch, "dlast": dseq, "known": {}}
     last_seen = {"t": time.monotonic()}
     bucket = TokenBucket(rate=5, burst=20)
     await websocket.send_json({"op": "hello", "heartbeat_s": s.s.heartbeat_s, "node": s.s.node_id,
-                               "game": gid, "seat": seat, "events": len(a.t.events)})
+                               "game": gid, "seat": seat, "events": len(a.t.events),
+                               "draft_epoch": a.t.draft_epoch, "dseq": a.t.dseq})
 
     async def presence() -> None:
         if seat is not None:
@@ -426,12 +441,9 @@ async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_se
 
     async def pusher() -> None:
         while True:
-            evs = await a.wait_events(cursor["next"], timeout=s.s.heartbeat_s)
-            for e in evs:
-                if e.seq < cursor["next"]:
-                    continue
-                await websocket.send_json({"op": "event", **e.to_dict()})
-                cursor["next"] = e.seq + 1
+            await a.wait_any(cursor["next"], cursor["dlast"], timeout=s.s.heartbeat_s)
+            for op, body in outbox(a.t, seat, cursor):
+                await websocket.send_json({"op": op, **body})
             if time.monotonic() - last_seen["t"] > s.s.heartbeat_s * 2:
                 metrics.WS_HEARTBEAT_TIMEOUTS.inc()
                 await websocket.close(code=4000, reason="heartbeat timeout")
@@ -451,6 +463,10 @@ async def _ws_session(websocket: WebSocket, gid: str, token: str | None, last_se
                 await websocket.send_json({"op": "pong", "t": msg.get("t")})
             elif op == "resume":
                 cursor["next"] = max(0, int(msg.get("last_seq", -1)) + 1)
+                if "epoch" in msg or "drafts" in msg:
+                    known = msg.get("drafts") if isinstance(msg.get("drafts"), dict) else {}
+                    cursor.update(epoch=msg.get("epoch"), dlast=int(msg.get("dseq", -1)),
+                                  known={str(k): int(v) for k, v in list(known.items())[:50]})
                 async with a.bell:
                     a.bell.notify_all()
             elif op == "act":
