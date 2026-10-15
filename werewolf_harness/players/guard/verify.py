@@ -26,14 +26,60 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# "I vote 4", "voting for player 4", "我投4号", "投票给 4"
+
+class _Intent:
+    """A vote-intent pattern plus the readings of it that are not this round's intent.
+
+    The guard compares a ballot with the vote the agent *announced this round*, so a
+    pattern that also catches a report or an explanation blocks honest ballots. In the
+    30-game baseline (docs/baseline_A.md) every one of the 46 say/do blocks was such a
+    misreading: "验出3号" / "给出1号" (a seer's result read as "出3号") and "第一轮我投
+    7号，是因为……" (explaining a past ballot). A match is therefore dropped when
+
+      - the clause it sits in (back to the last comma or full stop) names an earlier
+        time: 第一轮, 上一轮, 昨天, 之前, 刚才, 当时 ... -- it is about a past vote;
+      - it is followed by (是)因为 -- it explains a vote rather than announcing one;
+      - it is followed by 以外 / 之外 -- "投给6号以外的人" is not a vote for 6;
+      - it is negated right before: "先不要把3号投出去", "别出3号".
+
+    `search` keeps looking past a dropped match, so "第一轮我投6号是因为……今天我投3号"
+    still reads 3. Same interface as a compiled pattern (``search`` -> match or None),
+    which is what scripts/eval_baseline.py's audit relies on.
+    """
+
+    _CLAUSE_START = re.compile(r"[。！？!?；;，,、\n]")
+    _PAST = re.compile(r"第[一二三四五六七八九十\d]+[轮天晚夜]|上一?[轮天次晚]|昨[天晚日]|前[一两]?[轮天晚]"
+                       r"|之前|此前|刚才|当时|那时")
+    _NEGATED = re.compile(r"(?:不|别|勿)(?:要|能|该|会|应该|必|用)?\s*$")
+    _AFTER = re.compile(r"\s*[，,]?\s*(?:就?是|只是)?因为|\s*(?:以外|之外)")
+
+    def __init__(self, pattern: str):
+        self.rx = re.compile(pattern)
+        self.pattern = pattern
+
+    def _vetoed(self, text: str, m: re.Match) -> bool:
+        starts = [c.end() for c in self._CLAUSE_START.finditer(text, 0, m.start())]
+        clause = text[starts[-1] if starts else 0:m.start()]
+        return bool(self._PAST.search(clause) or self._NEGATED.search(clause) or self._AFTER.match(text, m.end()))
+
+    def search(self, text: str) -> re.Match | None:
+        for m in self.rx.finditer(text or ""):
+            if not self._vetoed(text, m):
+                return m
+        return None
+
+
+# "I vote 4", "voting for player 4", "我投4号", "投票给 4", "今天出3号", "把3号投出去"
 _VOTE_INTENT = [
     re.compile(r"(?i)\b(?:i\s+)?(?:will\s+|am\s+)?vot(?:e|ing)\s+(?:for\s+)?(?:player\s*)?#?(\d)\b"),
     re.compile(r"(?i)\bmy\s+vote\s+(?:goes\s+)?(?:to|for|is)\s+(?:player\s*)?#?(\d)\b"),
     re.compile(r"(?i)\b(?:let'?s|we should|everyone)\s+(?:all\s+)?vote\s+(?:out\s+)?(?:player\s*)?#?(\d)\b"),
-    re.compile(r"我(?:要|会|将)?投\s*#?(\d)\s*号?"),
-    re.compile(r"投票?给\s*#?(\d)\s*号?"),
-    re.compile(r"出\s*#?(\d)\s*号?"),
+    _Intent(r"我(?:要|会|将|就|还是|继续)?投\s*#?(\d)\s*号?"),
+    _Intent(r"投票?给\s*#?(\d)\s*号?"),
+    # an exile call ("今天出3号", "建议出3号"), not a report: 验出/查出/给出/报出/打出/票出 ...
+    # are what a seer found or what already happened
+    _Intent(r"(?<![验查给报打票跳找选指认看说提挑分放])出\s*#?(\d)\s*号"),
+    _Intent(r"把\s*#?(\d)\s*号?\s*(?:投|票|放逐|推)出去"),
 ]
 
 # What a piece of untrusted text is *instructing* the reader to do.

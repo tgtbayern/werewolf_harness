@@ -115,8 +115,10 @@ def test_role_assertions_refuse_hedges_and_reports():
 
 
 def test_guard_audit_measures_the_shipped_regex():
-    # the L3 guard's "出N号" pattern reads a seer report as a ballot announcement
-    target, trigger = eb.guard_declared_vote("1号起跳预言家并验出3号是狼。")
+    # the audit reads through the guard's own patterns: a seer report is no longer a ballot
+    # announcement (it was, before the 验出/给出 fix), an exile call still is
+    assert eb.guard_declared_vote("1号起跳预言家并验出3号是狼。") == (None, None)
+    target, trigger = eb.guard_declared_vote("1号验出3号是狼，今天出3号。")
     assert target == 3 and "出3号" in trigger
 
 
