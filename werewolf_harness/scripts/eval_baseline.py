@@ -39,8 +39,8 @@ import os
 import random
 import re
 from collections import Counter, defaultdict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Callable, Iterable
 
 Z95 = 1.959963984540054
 BOOTSTRAP_B = 2000
@@ -641,8 +641,15 @@ def reliability_metrics(games: list[Game]) -> dict:
             tr.append(1 if r.get("transport_retries") else 0)
             if e.task == "vote":
                 sd.append(1 if any(s.get("block_reason") == "say_do_consistency" for s in trace) else 0)
-        steps_ok.append(ok); malformed.append(mal); turn_retry.append(retry); forced.append(frc); fallback.append(fb)
-        loop_broken.append(lb); timeout.append(to); transport.append(tr); vote_turn_saydo.append(sd)
+        steps_ok.append(ok)
+        malformed.append(mal)
+        turn_retry.append(retry)
+        forced.append(frc)
+        fallback.append(fb)
+        loop_broken.append(lb)
+        timeout.append(to)
+        transport.append(tr)
+        vote_turn_saydo.append(sd)
         for k in _BLOCK_KINDS:
             blocked_by[k].append(per_kind[k])
     waste = defaultdict(lambda: {"steps": 0, "tokens": 0, "ms": 0})
@@ -722,7 +729,8 @@ def say_do_metrics(games: list[Game]) -> dict:
                 guard_rows.append({"trigger": trig, "guard_target": gt, "ours": claims.intent, "blocked_vote": blocked,
                                    "game": os.path.basename(g.path), "round": sp.round, "seat": sp.actor})
         for t in tiers:
-            covered[t].append(cov[t]); consistent[t].append(con[t])
+            covered[t].append(cov[t])
+            consistent[t].append(con[t])
         first_consistent.append(fc)
     # guard audit: is the L3 trigger a vote intent at all?
     non_vote = re.compile(r"[验查跳找选指报认说给]出|出局|出现|出来|出于|提出|给出|指出|看出|说出|找出")
@@ -807,7 +815,8 @@ def seer_metrics(games: list[Game]) -> dict:
         wolf_fake_seer_games += 1 if wolves_faking else 0
         wolf_seats_faking += len(wolves_faking)
         seer_ever_claimed += 1 if seer in claimants else 0
-        real_claims.append(rc); fake_claims.append(fc)
+        real_claims.append(rc)
+        fake_claims.append(fc)
     n_wolf_seats = sum(len(g.wolves()) for g in games)
     return {
         "seer_claims_seer": {"k": seer_ever_claimed, "n": len(games), "p": wilson(seer_ever_claimed, len(games))[0],
@@ -883,7 +892,6 @@ def leakage_metrics(games: list[Game]) -> dict:
     flagged = []
     for g in games:
         tot, acc = [], []
-        n = len(g.roles)
         for sp in _speeches(g):
             for a in role_assertions(sp.content, sp.actor):
                 tot.append(1)
@@ -1045,7 +1053,7 @@ _ORDER = {"night": 0, "speak": 1, "vote": 2, "review": 3}
 
 
 def headline_rows(m: dict) -> list[tuple[str, str]]:
-    c, l, r, s, sd, lk, h, o = (m[k] for k in ("cost", "latency", "reliability", "seer", "say_do", "leakage", "hallucination", "outcome"))
+    c, lat, r, s, sd, lk, h, o = (m[k] for k in ("cost", "latency", "reliability", "seer", "say_do", "leakage", "hallucination", "outcome"))
     sl = m["structural_leak"]
     g = m["meta"]["games"]
     return [
@@ -1054,9 +1062,9 @@ def headline_rows(m: dict) -> list[tuple[str, str]]:
         ("每局 token（本地估算，均值）", f"{fmt_stat(c['tokens_per_game_local'], 'mean', 0)} (n={g} 局)"),
         ("每局模型调用数（均值）", f"{fmt_stat(c['calls_per_game'], 'mean', 1)} (n={g} 局)"),
         ("每次调用 token（CLI）", f"{fmt_stat(c['tokens_per_call_cli'], 'mean', 0)} (n={g} 局)"),
-        ("单次模型调用延迟 p50 / p95（ms）", f"{fmt_stat(l['call_ms'], 'p50', 0)} / {fmt_stat(l['call_ms'], 'p95', 0)} (n={l['call_ms']['n']} 次)"),
-        ("每回合墙钟 p50 / p95（s）", f"{fmt_stat(l['turn_wall_s'], 'p50', 2)} / {fmt_stat(l['turn_wall_s'], 'p95', 2)} (n={l['turn_wall_s']['n']} 回合)"),
-        ("整局时长（s，均值）", f"{fmt_stat(l['game_s'], 'mean', 1)} (n={g} 局)"),
+        ("单次模型调用延迟 p50 / p95（ms）", f"{fmt_stat(lat['call_ms'], 'p50', 0)} / {fmt_stat(lat['call_ms'], 'p95', 0)} (n={lat['call_ms']['n']} 次)"),
+        ("每回合墙钟 p50 / p95（s）", f"{fmt_stat(lat['turn_wall_s'], 'p50', 2)} / {fmt_stat(lat['turn_wall_s'], 'p95', 2)} (n={lat['turn_wall_s']['n']} 回合)"),
+        ("整局时长（s，均值）", f"{fmt_stat(lat['game_s'], 'mean', 1)} (n={g} 局)"),
         ("ReAct 步成功率（未被拦）", fmt_prop(r["step_success"])),
         ("回合内有拒绝并重试", fmt_prop(r["turn_rejected_and_retried"])),
         ("回合走到强制终结（步数用尽）", fmt_prop(r["turn_forced_terminal"])),
@@ -1074,10 +1082,10 @@ def headline_rows(m: dict) -> list[tuple[str, str]]:
 
 def findings(m: dict, comparisons: dict[str, dict]) -> list[str]:
     """The few sentences a reader should leave with, computed from the numbers (never typed in)."""
-    c, l, r, sd, s = m["cost"], m["latency"], m["reliability"], m["say_do"], m["seer"]
+    c, lat, r, sd, s = m["cost"], m["latency"], m["reliability"], m["say_do"], m["seer"]
     sl, ga = m["structural_leak"], m["say_do"]["guard_audit"]
     sdc = r["blocked_step_cost"].get("say_do_consistency", {"steps": 0, "token_share": 0, "ms_share": 0})
-    vote = l["by_task"].get("vote", {}).get("turn_wall_s")
+    vote = lat["by_task"].get("vote", {}).get("turn_wall_s")
     out = [
         f"**L3 言行一致守卫是最大的浪费源，且几乎全是误拦**：{sdc['steps']} 个被拦步骤占全部 ReAct token 的 {_f(sdc['token_share'], 1, True)}、"
         f"模型耗时的 {_f(sdc['ms_share'], 1, True)}；被拦的 {ga['saydo_blocked_votes']} 个投票回合里，{ga['saydo_blocked_votes_from_non_vote_trigger']} 个由“验出N号/给出N号”"
@@ -1092,15 +1100,15 @@ def findings(m: dict, comparisons: dict[str, dict]) -> list[str]:
     ]
     seq = next((v for k, v in comparisons.items() if "pilot" in k or "顺序" in k), None)
     if seq:
-        out.append(f"**提速**：整局 {fmt_stat(seq['latency']['game_s'], 'mean', 0)} s（顺序，{seq['meta']['games']} 局）→ {fmt_stat(l['game_s'], 'mean', 0)} s（并行，{m['meta']['games']} 局）；"
+        out.append(f"**提速**：整局 {fmt_stat(seq['latency']['game_s'], 'mean', 0)} s（顺序，{seq['meta']['games']} 局）→ {fmt_stat(lat['game_s'], 'mean', 0)} s（并行，{m['meta']['games']} 局）；"
                    f"每次调用 token {fmt_stat(seq['cost']['tokens_per_call_cli'], 'mean', 0)} → {fmt_stat(c['tokens_per_call_cli'], 'mean', 0)}，"
-                   f"单次调用 p50 {fmt_stat(seq['latency']['call_ms'], 'p50', 0)} → {fmt_stat(l['call_ms'], 'p50', 0)} ms。顺序组只有 2 局，方向可信、幅度不精确。")
+                   f"单次调用 p50 {fmt_stat(seq['latency']['call_ms'], 'p50', 0)} → {fmt_stat(lat['call_ms'], 'p50', 0)} ms。顺序组只有 2 局，方向可信、幅度不精确。")
     return out
 
 
 def render(m: dict, comparisons: dict[str, dict]) -> str:
     meta = m["meta"]
-    c, l, r = m["cost"], m["latency"], m["reliability"]
+    c, lat, r = m["cost"], m["latency"], m["reliability"]
     sd, s, lk, h, o = m["say_do"], m["seer"], m["leakage"], m["hallucination"], m["outcome"]
     L = []
     w = L.append
@@ -1142,19 +1150,19 @@ def render(m: dict, comparisons: dict[str, dict]) -> str:
 
     w("## 2. 延迟\n")
     w("| 指标 | 均值 [CI] | p50 [CI] | p95 [CI] | n |\n|---|---|---|---|---|")
-    w(f"| 单次模型调用（ReAct 步，ms） | {fmt_dist(l['call_ms'], 0)} |")
-    if l["note_ms"]:
-        w(f"| 笔记调用（ms，后台线程，不在关键路径） | {fmt_dist(l['note_ms'], 0)} |")
-    w(f"| 每回合模型耗时（s，含笔记） | {fmt_dist(l['turn_model_s'], 2)} |")
-    w(f"| 每回合墙钟（s，committed−asked） | {fmt_dist(l['turn_wall_s'], 2)} |")
-    w(f"| 整局（s） | {fmt_dist(l['game_s'], 1)} |")
+    w(f"| 单次模型调用（ReAct 步，ms） | {fmt_dist(lat['call_ms'], 0)} |")
+    if lat["note_ms"]:
+        w(f"| 笔记调用（ms，后台线程，不在关键路径） | {fmt_dist(lat['note_ms'], 0)} |")
+    w(f"| 每回合模型耗时（s，含笔记） | {fmt_dist(lat['turn_model_s'], 2)} |")
+    w(f"| 每回合墙钟（s，committed−asked） | {fmt_dist(lat['turn_wall_s'], 2)} |")
+    w(f"| 整局（s） | {fmt_dist(lat['game_s'], 1)} |")
     w("\n按阶段：\n\n| 阶段 | 回合墙钟 s（均值/p50/p95） | 单个阶段墙钟 s（均值/p50/p95） | 每局该阶段合计 s（均值） | 阶段数 |\n|---|---|---|---|---|")
-    for task, d in sorted(l["by_task"].items(), key=lambda kv: _ORDER.get(kv[0], 9)):
+    for task, d in sorted(lat["by_task"].items(), key=lambda kv: _ORDER.get(kv[0], 9)):
         w(f"| {TASK_ZH.get(task, task)} | {fmt_stat(d['turn_wall_s'], 'mean', 2)} / {fmt_stat(d['turn_wall_s'], 'p50', 2)} / {fmt_stat(d['turn_wall_s'], 'p95', 2)} | "
           f"{fmt_stat(d['phase_wall_s'], 'mean', 1)} / {fmt_stat(d['phase_wall_s'], 'p50', 1)} / {fmt_stat(d['phase_wall_s'], 'p95', 1)} | "
           f"{fmt_stat(d['phase_wall_per_game_s'], 'mean', 1)} | {d['phase_wall_s']['n']} |")
-    if l["asked_ahead"]:
-        w(f"\n提前发问（ahead=true，与上一回合重叠）的回合占比：{fmt_prop(l['asked_ahead'])}。")
+    if lat["asked_ahead"]:
+        w(f"\n提前发问（ahead=true，与上一回合重叠）的回合占比：{fmt_prop(lat['asked_ahead'])}。")
     w("")
 
     if comparisons:
