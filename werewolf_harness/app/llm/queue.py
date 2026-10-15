@@ -17,9 +17,19 @@ actor accepts a result only for the exact `version` it is waiting on.
 
 Lanes are strict priority: a turn with a person waiting at the table goes
 before an AI-only game, which goes before offline evaluation. Fairness *within*
-a lane needs no scheduler: a game has at most one outstanding turn (the game is
-turn-based and the actor waits for it), so FIFO order is already round-robin
-over games -- one chatty game cannot starve the others.
+a lane: since the actor asks every open turn at once (a vote asks 8 seats), one
+game can put 8 jobs in a lane in one instant, and FIFO would serve all 8 before
+another game's single turn. A stream cannot be reordered, so the node bounds it
+at the source instead: a game has at most `per_game_asks` jobs in the stream;
+the rest wait on the node and go out as that game's answers come back. FIFO over
+games that each hold at most k places is round-robin within a factor of k.
+(The in-process LocalExecutor can do better -- true per-game fair queuing --
+because it owns its queue; see runtime/agents.py and docs/adr/0011.)
+
+Load: `load_sample()` reads each lane's consumer-group lag (jobs not yet taken
+by any worker), the age of the oldest of them, the pending count (taken, not
+acknowledged = in flight), and the capacity the live workers announce in
+`llm:workers` -- the inputs of the overload signal (runtime/load.py).
 
 Jobs carry only (game, seat, version, task, memory). The worker rebuilds the
 exact view and legal actions by replaying the journal (a few ms), so nothing
@@ -33,6 +43,7 @@ import json
 import os
 import socket
 import time
+from collections import deque
 from collections.abc import Callable
 
 from redis.asyncio import Redis
@@ -42,10 +53,12 @@ from ..config import Settings
 from ..obs import logging as olog
 from ..obs import metrics, tracing
 from ..runtime.agents import AgentJob, AgentResult, run_agent_turn
+from ..runtime.load import LatencyWindow, LoadSample
 from ..runtime.table import Table, TableConfig
 
 LANES = ("human", "online", "offline")
 GROUP = "workers"
+WORKERS_KEY = "llm:workers"           # hash: consumer -> {"capacity", "ts"}, refreshed by each worker
 log = olog.get("llm.queue")
 
 
@@ -60,12 +73,17 @@ def results_key(node: str) -> str:
 class StreamExecutor:
     """The node side: publish jobs, receive results, hand them to the actors."""
 
-    def __init__(self, redis: Redis, settings: Settings):
+    def __init__(self, redis: Redis, settings: Settings, per_game_asks: int | None = None):
         self.r = redis
         self.s = settings
         self.node = settings.node_id
         self.deliver: dict[str, Callable[[AgentResult], None]] = {}
         self.inflight = 0
+        self.per_game_asks = settings.per_game_asks if per_game_asks is None else per_game_asks
+        # per game: jobs in the stream (seat, version) -> when sent, and jobs held back on the node
+        self.out: dict[str, dict[tuple[int, int], float]] = {}
+        self.held: dict[str, deque[AgentJob]] = {}
+        self.latency = LatencyWindow()                     # per-turn service time on the workers
         self._task: asyncio.Task | None = None
         self._last_id = "$"
 
@@ -81,6 +99,35 @@ class StreamExecutor:
 
     def submit(self, job: AgentJob, deliver: Callable[[AgentResult], None]) -> None:
         self.deliver[job.game_id] = deliver
+        self.held.setdefault(job.game_id, deque()).append(job)
+        self._release(job.game_id)
+
+    def _release(self, gid: str) -> None:
+        """Send this game's held jobs while it has fewer than per_game_asks in the stream."""
+        out = self.out.setdefault(gid, {})
+        # a job whose answer never comes back (dead-lettered, or the worker dropped it
+        # and is from before stale replies) must not hold its slot for ever
+        ttl = self.s.agent_timeout_s + 5
+        now = time.monotonic()
+        for k in [k for k, t in out.items() if now - t > ttl]:
+            del out[k]
+        q = self.held.get(gid)
+        while q and (not self.per_game_asks or len(out) < self.per_game_asks):
+            job = q.popleft()
+            out[(job.seat, job.version)] = now
+            self._publish(job)
+        if not q:
+            self.held.pop(gid, None)
+        if not out:
+            self.out.pop(gid, None)
+
+    def _settle(self, gid: str, seat: int, version: int) -> None:
+        out = self.out.get(gid)
+        if out is not None:
+            out.pop((seat, version), None)
+        self._release(gid)
+
+    def _publish(self, job: AgentJob) -> None:
         self.inflight += 1
         fields = {"game_id": job.game_id, "seat": job.seat, "version": job.version, "task": job.task,
                   "memory": json.dumps(job.memory, ensure_ascii=False) if job.memory else "",
@@ -104,11 +151,59 @@ class StreamExecutor:
                     self._last_id = eid
                     d = json.loads(_s(f[b"r"] if b"r" in f else f["r"]))
                     self.inflight = max(0, self.inflight - 1)
+                    self._settle(d["game_id"], int(d["seat"]), int(d["version"]))
+                    if d.get("stale"):
+                        continue                           # the worker dropped it: only its slot comes back
+                    if (d.get("meta") or {}).get("ms") is not None:
+                        self.latency.record(d["meta"]["ms"])
                     fn = self.deliver.get(d["game_id"])
                     if fn:
                         mem = d.get("memory")
                         fn(AgentResult(d["game_id"], d["seat"], d["version"], d.get("action"), d.get("forced", False),
                                        tuple(mem) if mem else None, d.get("meta") or {}, d.get("error")))
+
+
+    async def load_sample(self) -> LoadSample:
+        """Queue depth / oldest wait per lane from the consumer group, capacity from live workers."""
+        depth: dict[str, int] = {}
+        oldest_ms: int | None = None
+        pending = 0
+        for lane in LANES:
+            key = jobs_key(lane)
+            try:
+                groups = await self.r.xinfo_groups(key)
+            except Exception:                              # noqa: BLE001 -- no stream yet
+                depth[lane] = 0
+                continue
+            g = next((g for g in groups if _s(g.get("name")) == GROUP), None)
+            if g is None:
+                depth[lane] = 0
+                continue
+            lag = g.get("lag")
+            pending += int(g.get("pending") or 0)
+            last = _s(g.get("last-delivered-id") or "0-0")
+            nxt = await self.r.xrange(key, min="(" + last, max="+", count=1)
+            if lag is None:                                # Redis < 7: count what is past the cursor
+                lag = len(await self.r.xrange(key, min="(" + last, max="+", count=10_000))
+            depth[lane] = int(lag)
+            if nxt:
+                ms = int(_s(nxt[0][0]).split("-")[0])
+                oldest_ms = ms if oldest_ms is None else min(oldest_ms, ms)
+        held = sum(len(q) for q in self.held.values())
+        if held:
+            depth["held"] = held
+        cap = 0
+        now = time.time()
+        for _k, v in (await self.r.hgetall(WORKERS_KEY)).items():
+            try:
+                w = json.loads(_s(v))
+            except ValueError:
+                continue
+            if now - float(w.get("ts", 0)) < 10:
+                cap += int(w.get("capacity", 0))
+        p50, _p95, _n = self.latency.quantiles()
+        return LoadSample(depth=depth, oldest_wait_s=0.0 if oldest_ms is None else max(0.0, now - oldest_ms / 1000),
+                          inflight=pending, capacity=max(1, cap), turn_p50_ms=p50)
 
 
 class Worker:
@@ -120,6 +215,7 @@ class Worker:
         self.s, self.store, self.r, self.hub = settings, store, redis, hub
         self.consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
         self.sem = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
         # its own pool: asyncio.to_thread's default pool is min(32, cpus + 4) threads, which
         # load testing found capping a 2-core worker at ~6 turns in flight (~8 commits/s)
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="turn")
@@ -145,6 +241,7 @@ class Worker:
     async def run(self) -> None:
         await self.ensure_groups()
         reclaim = asyncio.create_task(self._reclaim_loop())
+        beat = asyncio.create_task(self._announce_loop())
         try:
             while not self._stop:
                 await self.sem.acquire()
@@ -158,6 +255,21 @@ class Worker:
                 t.add_done_callback(self._tasks.discard)
         finally:
             reclaim.cancel()
+            beat.cancel()
+            try:
+                await self.r.hdel(WORKERS_KEY, self.consumer)
+            except Exception:                              # noqa: BLE001
+                pass
+
+    async def _announce_loop(self) -> None:
+        """Tell nodes how many jobs this worker can run at once (their load signal's capacity)."""
+        while True:
+            try:
+                await self.r.hset(WORKERS_KEY, self.consumer,
+                                  json.dumps({"capacity": self.concurrency, "ts": time.time()}))
+            except Exception:                              # noqa: BLE001 -- redis blip
+                pass
+            await asyncio.sleep(2.0)
 
     async def stop(self) -> None:
         self._stop = True
@@ -189,7 +301,10 @@ class Worker:
             self.waits.setdefault(lane, []).append(wait_ms)
             metrics.QUEUE_WAIT_MS.labels(lane=lane).observe(wait_ms)
             reply = await self._run(f)
-            if reply is not None:
+            if reply is None:
+                # tell the node it was dropped, so the game's slot in the stream comes back
+                reply = {"game_id": f["game_id"], "seat": int(f["seat"]), "version": int(f["version"]), "stale": True}
+            if f.get("reply_to"):
                 await self.r.xadd(results_key(f["reply_to"]), {"r": json.dumps(reply, ensure_ascii=False, default=str)},
                                   maxlen=10_000, approximate=True)
             await self.r.xack(jobs_key(lane), GROUP, eid)

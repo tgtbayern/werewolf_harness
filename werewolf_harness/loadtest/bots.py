@@ -32,6 +32,7 @@ class Stats:
         self.acts = 0
         self.tables_started = 0
         self.tables_over = 0
+        self.queued_polls = 0
 
     def err(self, k: str) -> None:
         self.errors[k] = self.errors.get(k, 0) + 1
@@ -47,9 +48,17 @@ async def table(i: int, url: str, model: str, stats: Stats, stop: float) -> None
         try:
             tok = (await c.post("/api/auth/guest", json={})).json()["token"]
             h = {"Authorization": f"Bearer {tok}"}
-            g = (await c.post("/api/games", json={"variant": "8p", "models": [model], "human_seats": [1],
-                                                  "turn_seconds": 60, "seed": 1000 + i}, headers=h)).json()
+            resp = await c.post("/api/games", json={"variant": "8p", "models": [model], "human_seats": [1],
+                                                    "turn_seconds": 60, "seed": 1000 + i}, headers=h)
+            if resp.status_code == 503:              # overload protection refused it (docs/adr/0011)
+                stats.err("refused_503")
+                return
+            g = resp.json()
             gid = g["id"]
+            while g.get("state") == "queued" and time.time() < stop:
+                stats.queued_polls += 1              # in line: wait until the node starts it
+                await asyncio.sleep(1.0)
+                g = (await c.get(f"/api/games/{gid}/queue")).json()
             st_ = (await c.post(f"/api/games/{gid}/join", json={"seat": 1}, headers=h)).json()["seat_token"]
             sh = {"Authorization": f"Bearer {st_}"}
             await c.post(f"/api/games/{gid}/start", headers=sh)

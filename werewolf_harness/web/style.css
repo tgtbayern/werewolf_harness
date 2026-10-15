@@ -43,6 +43,14 @@ header {
 }
 header h1 { font-size: 21px; font-weight: 700; letter-spacing: -.015em; margin: 0; }
 header .lede { font-size: 13.5px; color: var(--muted); font-style: italic; }
+/* overload protection: the node's load, and a queued table's place in line (docs/adr/0011) */
+.loadbadge { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid var(--good); color: var(--good); margin-left: 10px; }
+.loadbadge.busy { border-color: #b7791f; color: #b7791f; }
+.loadbadge.overloaded { border-color: var(--live); color: var(--live); }
+.queuebar { border: 1px solid #b7791f; background: #fbf3e4; color: #6b4a12; padding: 10px 14px;
+  margin-bottom: 12px; font-size: 14px; border-radius: 4px; }
+.queuebar .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
 nav { display: flex; gap: 18px; font-family: var(--mono); font-size: 12px; }
 nav a { color: var(--muted); text-decoration: none; padding-bottom: 2px; }
 nav a:hover { color: var(--ink); }

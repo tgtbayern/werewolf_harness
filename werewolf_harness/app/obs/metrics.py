@@ -35,6 +35,15 @@ MAILBOX_BACKLOG = Gauge("wh_mailbox_backlog", "messages waiting in all game mail
 TIMERS_PENDING = Gauge("wh_timers_pending", "timeouts in the timing wheel")
 AGENTS_INFLIGHT = Gauge("wh_agents_inflight", "model turns running")
 
+# overload protection (runtime/load.py, runtime/admission.py)
+LOAD_PRESSURE = Gauge("wh_load_pressure", "overload score of the model layer (1.0 = at the limit)")
+OVERLOADED = Gauge("wh_overloaded", "1 while the node refuses to start new games")
+QUEUE_DEPTH = Gauge("wh_llm_queue_depth", "model jobs waiting for a worker", ["lane"])
+ADMISSION_QUEUE = Gauge("wh_admission_queue", "new games waiting to be started")
+ADMISSIONS = Counter("wh_admissions_total", "what happened to a game creation", ["decision"])  # admit|queue|reject
+ADMISSION_WAIT_S = Histogram("wh_admission_wait_s", "how long a queued game waited to start",
+                             buckets=(1, 2, 5, 10, 20, 30, 60, 120, 300, 600))
+
 _rt = None
 
 
@@ -50,6 +59,9 @@ def _refresh() -> None:
     MAILBOX_BACKLOG.set(sum(a.mailbox.qsize() for a in _rt.actors.values()))
     TIMERS_PENDING.set(_rt.wheel.pending)
     AGENTS_INFLIGHT.set(getattr(_rt.executor, "inflight", 0))
+    adm = getattr(_rt, "admission", None)
+    if adm is not None:
+        ADMISSION_QUEUE.set(len(adm))
 
 
 def render() -> tuple[bytes, str]:

@@ -9,6 +9,8 @@ A node drives a game only while it holds that game's lease. Three loops:
             adopted -- replayed from its journal, model memory restored, and the
             current turn asked again
   (startup) is just the first scan
+  load      every load_tick_s: sample the model layer's load (load.py) and start
+            queued games while it has room (admission.py, docs/adr/0011)
 
 Replay is cheap enough to do on every adoption: a whole 12-seat game (~150 steps)
 replays in about 3 ms, so there are no snapshots (docs/adr/0003).
@@ -16,6 +18,7 @@ replays in about 3 ms, so there are no snapshots (docs/adr/0003).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import secrets
 import time
 from collections.abc import Callable
@@ -29,8 +32,10 @@ from ..config import Settings
 from ..obs import logging as olog
 from ..storage import Store
 from .actor import ActorHooks, GameActor
+from .admission import ADMIT, QUEUE, REJECT, Admission, Overloaded, Ticket
 from .agents import LocalExecutor
 from .lease import Leases
+from .load import LoadMonitor, LoadSample, Thresholds
 from .table import Table, TableConfig
 from .timers import TimingWheel
 
@@ -45,7 +50,7 @@ class Runtime:
         self.redis = redis
         self.node = settings.node_id
         self.leases = Leases(redis, self.node, settings.lease_ttl_ms)
-        self.executor = executor or LocalExecutor(settings.agent_workers)
+        self.executor = executor or LocalExecutor(settings.agent_workers, fair=settings.fair_queuing)
         self.wheel = TimingWheel(tick=0.1)
         self.env_keys = env_keys or {}
         self.hub = hub                              # app.llm.gateway.Hub (model layer), optional
@@ -57,6 +62,14 @@ class Runtime:
         self._adopting: set[str] = set()
         self.counters = {"adopted": 0, "lost_leases": 0, "created": 0}
         self.listeners: list[Callable[[str, dict], Any]] = []
+        self.monitor = LoadMonitor(Thresholds(
+            wait_s=settings.overload_wait_s, demand_per_slot=settings.overload_demand_per_slot,
+            latency_ms=settings.overload_latency_ms, enter=settings.overload_enter, exit=settings.overload_exit,
+            hold_s=settings.overload_hold_s, per_game_tau_s=settings.overload_per_game_tau_s),
+            gateway_latency=getattr(hub, "latency", None))
+        self.admission = Admission(max_queue=settings.max_queued_games, max_active=settings.max_active_games,
+                                   probe_s=settings.admission_probe_s)
+        self._ended_seen: set[str] = set()
 
     # ------------------------------------------------------------ lifecycle
     async def start(self, scan: bool = True) -> None:
@@ -70,6 +83,8 @@ class Runtime:
         if scan:
             await self.scan()
             self._tasks.append(asyncio.create_task(self._scan_loop(), name="recovery-scan"))
+        await self._requeue()
+        self._tasks.append(asyncio.create_task(self._load_loop(), name="load"))
 
     async def shutdown(self, drain: bool = True) -> None:
         """Stop driving games and hand them over. With drain, leases are released
@@ -91,17 +106,53 @@ class Runtime:
     # ------------------------------------------------------------ games
     async def create(self, cfg: TableConfig, *, seed: int | None = None, created_by: str | None = None,
                      start: bool | None = None) -> GameActor:
+        """Start a game now, whatever the load (tests, benches). The public door is
+        `request`, which goes through admission control."""
+        table = self._new_table(cfg, seed)
+        await self.store.create_game(game_id=table.id, variant=cfg.variant, seed=table.seed, config=cfg.to_dict(),
+                                     state=table.state, seats=table.seat_rows(), created_by=created_by)
+        return await self._launch(table)
+
+    async def request(self, cfg: TableConfig, *, seed: int | None = None,
+                      created_by: str | None = None) -> tuple[str, GameActor | None, dict]:
+        """Create a game through admission control: ("admit", actor, {}) when it started,
+        ("queue", None, {game_id, position, eta_s, ...}) when it waits in line.
+        Raises Overloaded when the line is full."""
+        if not self.s.admission:
+            return ADMIT, await self.create(cfg, seed=seed, created_by=created_by), {}
+        self._validate(cfg)
+        await self.refresh_load()
+        d = self.admission.decide(overloaded=self.monitor.overloaded, active=self.active_games(),
+                                  busy=self.monitor.level == "busy")
+        if d == REJECT:
+            raise Overloaded(self.admission.retry_after_s(self.active_games()))
+        if d == ADMIT:
+            return ADMIT, await self.create(cfg, seed=seed, created_by=created_by), {}
+        table = self._new_table(cfg, seed)
+        await self.store.create_game(game_id=table.id, variant=cfg.variant, seed=table.seed, config=cfg.to_dict(),
+                                     state="queued", seats=table.seat_rows(), created_by=created_by,
+                                     owner_node=self.node)
+        self.admission.push(Ticket(table.id, table))
+        olog.kv(log, 20, "game queued", game_id=table.id, position=len(self.admission),
+                pressure=round(self.monitor.pressure, 2))
+        return QUEUE, None, self.queue_info(table.id) or {}
+
+    def _validate(self, cfg: TableConfig) -> None:
         for m in cfg.models:
             why = retired(m)
             if why:
                 raise ValueError(f"{m} 已经下架（{why}）")
         if self.draining:
             raise RuntimeError("this node is draining; try again")
+
+    def _new_table(self, cfg: TableConfig, seed: int | None) -> Table:
+        self._validate(cfg)
         gid = "g" + secrets.token_hex(4)
         seed = seed if seed is not None else int.from_bytes(secrets.token_bytes(2), "big")
-        table = Table(gid, seed, cfg, self.env_keys, hub=self.hub)
-        await self.store.create_game(game_id=gid, variant=cfg.variant, seed=seed, config=cfg.to_dict(),
-                                     state=table.state, seats=table.seat_rows(), created_by=created_by)
+        return Table(gid, seed, cfg, self.env_keys, hub=self.hub)
+
+    async def _launch(self, table: Table) -> GameActor:
+        gid = table.id
         if not await self.leases.acquire(gid):
             raise RuntimeError("could not take the lease on a brand-new game")
         token = await self.store.bump_fencing(gid, self.node)
@@ -109,9 +160,89 @@ class Runtime:
         actor = self._actor(table, token)
         self.counters["created"] += 1
         if table.state == "running":
-            table.emit("phase", phase="start", seed=seed)
+            table.emit("phase", phase="start", seed=table.seed)
         actor.launch()
         return actor
+
+    # ------------------------------------------------------------ load + admission
+    def active_games(self) -> int:
+        return sum(1 for a in self.actors.values() if a.stopped is None)
+
+    def queue_info(self, gid: str) -> dict | None:
+        info = self.admission.info(gid, self.active_games())
+        return {"game_id": gid, **info} if info else None
+
+    async def refresh_load(self) -> bool:
+        """Sample the executor now and update the overload state."""
+        fn = getattr(self.executor, "load_sample", None)
+        sample = fn() if fn else LoadSample(inflight=getattr(self.executor, "inflight", 0))
+        if inspect.isawaitable(sample):
+            sample = await sample
+        sample.games = self.active_games()
+        return self.monitor.observe(sample)
+
+    def load_view(self) -> dict:
+        n = self.active_games()
+        return {**self.monitor.view(), "node": self.node, "active_games": n,
+                "admission": {"enabled": self.s.admission, "queued_games": len(self.admission),
+                              "max_queued_games": self.admission.max_queue,
+                              "max_active_games": self.admission.max_active,
+                              "probe_s": self.admission.probe_s,
+                              "next_eta_s": self.admission.eta_s(len(self.admission) + 1, n),
+                              "mean_game_s": round(self.admission.mean_game_s, 1),
+                              "counts": dict(self.admission.counts)}}
+
+    async def admit_queued(self, limit: int = 1) -> int:
+        """Start up to `limit` queued games, oldest first, while there is room."""
+        n = 0
+        while n < limit and self.admission.can_start_next(overloaded=self.monitor.overloaded,
+                                                          active=self.active_games(),
+                                                          busy=self.monitor.level == "busy"):
+            t = self.admission.pop()
+            table = t.table
+            try:
+                await self.store.set_state(table.id, table.state)        # queued -> waiting | running
+                await self._launch(table)
+            except Exception:                                  # noqa: BLE001 -- one bad start must not block the line
+                log.exception("could not start queued game %s", table.id)
+                continue
+            olog.kv(log, 20, "game admitted from queue", game_id=table.id,
+                    waited_s=round(self.admission.waits[-1], 1))
+            n += 1
+        return n
+
+    async def _requeue(self) -> None:
+        """After a restart: this node's queued games go back in line, oldest first."""
+        try:
+            rows = await self.store.queued_games(self.node)
+        except Exception:                                      # noqa: BLE001 -- no such state yet: nothing queued
+            log.exception("could not read queued games")
+            return
+        for r in rows:
+            if r["id"] in self.admission:
+                continue
+            table = Table(r["id"], r["seed"], TableConfig.from_dict(r["config"]), self.env_keys,
+                          created=r["created_at"].timestamp(), hub=self.hub)
+            self.admission.push(Ticket(r["id"], table, enqueued=r["created_at"].timestamp()))
+
+    def _note_ended(self) -> None:
+        for gid, a in list(self.actors.items()):
+            if a.stopped == "finished" and gid not in self._ended_seen:
+                self._ended_seen.add(gid)
+                self.admission.game_ended(time.time() - a.t.created)
+        self._ended_seen &= set(self.actors)
+
+    async def _load_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.s.load_tick_s)
+            try:
+                await self.refresh_load()
+                self._note_ended()
+                await self.admit_queued(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:                                  # noqa: BLE001 -- a failed tick is retried next tick
+                log.exception("load tick failed")
 
     async def import_log(self, log: dict, *, max_tokens: int | None = None, created_by: str | None = None) -> GameActor:
         """Continue a game from an old JSON save (the pre-database format).

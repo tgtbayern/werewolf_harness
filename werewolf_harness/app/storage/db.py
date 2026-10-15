@@ -75,13 +75,13 @@ class Store:
     # ------------------------------------------------------------ games
     async def create_game(self, *, game_id: str, variant: str, seed: int, config: dict, state: str,
                           seats: Iterable[tuple[int, str, str | None]], created_by: str | None = None,
-                          resumed_from: str | None = None) -> None:
+                          resumed_from: str | None = None, owner_node: str | None = None) -> None:
         async with self.engine.begin() as c:
             await c.execute(text(
-                "INSERT INTO games (id, variant, seed, config, state, created_by, resumed_from) "
-                "VALUES (:id, :v, :s, CAST(:cfg AS jsonb), :st, :by, :rf)"),
+                "INSERT INTO games (id, variant, seed, config, state, created_by, resumed_from, owner_node) "
+                "VALUES (:id, :v, :s, CAST(:cfg AS jsonb), :st, :by, :rf, :own)"),
                 {"id": game_id, "v": variant, "s": seed, "cfg": json.dumps(config, ensure_ascii=False),
-                 "st": state, "by": created_by, "rf": resumed_from})
+                 "st": state, "by": created_by, "rf": resumed_from, "own": owner_node})
             await c.execute(text("INSERT INTO game_seats (game_id, seat, kind, model) VALUES (:g, :seat, :k, :m)"),
                             [{"g": game_id, "seat": s, "k": k, "m": m} for s, k, m in seats])
 
@@ -111,6 +111,14 @@ class Store:
                 "SELECT id, state, owner_node, fencing_token FROM games "
                 "WHERE state IN ('waiting', 'running') ORDER BY created_at"))).mappings().all()
         return [dict(r) for r in rows]
+
+    async def queued_games(self, node: str) -> list[dict]:
+        """Games this node put in its admission queue and has not started (oldest first)."""
+        async with self.engine.connect() as c:
+            rows = (await c.execute(text(
+                "SELECT id, seed, config, created_at FROM games WHERE state = 'queued' AND owner_node = :n "
+                "ORDER BY created_at"), {"n": node})).mappings().all()
+        return [{**dict(r), "config": _j(r["config"])} for r in rows]
 
     async def recent_games(self, limit: int = 50) -> list[dict]:
         async with self.engine.connect() as c:

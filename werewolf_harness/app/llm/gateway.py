@@ -127,6 +127,10 @@ class Hub:
         self.sim_cache = PrefixCache()
         self.sim_sleep = sim_sleep
         self.limiter_wait_s = limiter_wait_s
+        # recent per-call latency of answered (or timed-out) calls: the load monitor's
+        # view of how fast the providers are right now (runtime/load.py)
+        from ..runtime.load import LatencyWindow
+        self.latency = LatencyWindow()
 
     def breaker(self, name: str) -> Breaker:
         with self._lock:
@@ -208,10 +212,13 @@ class GatewayClient(LLMClient):
                     br.record(False)
                     metrics.BREAKER_STATE.labels(provider=model).set(1 if br.state == "open" else 0)
                 reason = reason or why
+                if why == "timeout":
+                    self.hub.latency.record(ms)
                 self._record(model, "timeout" if why == "timeout" else "error", latency_ms=ms, fallback_reason=why)
                 metrics.LLM_CALL_MS.labels(model=model, status="error").observe(ms)
                 continue
             ms = int((time.monotonic() - t0) * 1000)
+            self.hub.latency.record(ms)
             cached_now = cached_tokens_of(resp)
             span.set_attribute("gen_ai.usage.input_tokens", resp.prompt_tokens)
             span.set_attribute("gen_ai.usage.output_tokens", resp.completion_tokens)
