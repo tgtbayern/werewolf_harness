@@ -266,6 +266,11 @@ class FlakyMockClient(MockClient):
         super().__init__(seed=seed, name=name or "mock-flaky", **kw)
         self.bad_rate = bad_rate
 
+    # Streams by chunking the whole reply (the base default), as ChaosMockClient does: the
+    # timed stream of MockClient calls _decide() directly and would skip the mistakes in
+    # chat(), so a streaming seat (every online speech) would never make one to escalate on.
+    chat_stream = LLMClient.chat_stream
+
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
         digest = hashlib.sha256(json.dumps([self.seed, messages, [t["function"]["name"] for t in tools or []]],
                                            ensure_ascii=False, default=str).encode()).hexdigest()

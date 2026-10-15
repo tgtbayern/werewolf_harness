@@ -241,6 +241,78 @@ def test_without_a_cascade_the_turn_record_is_unchanged():
     assert "cascade" not in d and all("model" not in s and "escalated" not in s for s in d["react_trace"])
 
 
+# ------------------------------------------------------------ escalation on the streaming path
+
+def _streaming_player(cheap, strong, events, **kw):
+    p = _player(cheap, strong, **kw)
+    p.on_draft = lambda k, a, t: events.append((k, a, t))
+    return p
+
+
+def _drafts(events, attempt):
+    return "".join(t for k, a, t in events if k == "delta" and a == attempt)
+
+
+@pytest.mark.parametrize("cheap_says,kw,reason", [
+    ("我没什么想说的，过。", {"low_confidence": True}, "low_confidence"),   # asked again, not refused
+    ("我觉得大家都挺好。", {"low_confidence": True, "mode": "both"}, "low_confidence"),
+])
+def test_an_escalated_speech_retracts_the_cheap_draft_and_streams_the_strong_one(cheap_says, kw, reason):
+    env, turn = _turn("speak")
+    events: list[tuple[str, int, str]] = []
+    cheap = Tier("cheap", [("speak", {"content": cheap_says})])
+    strong = Tier("strong", [("speak", {"content": "我怀疑3号"})])
+    p = _streaming_player(cheap, strong, events, **kw)
+    assert _act(p, env, turn)["args"]["content"] == "我怀疑3号"
+    assert [e["reason"] for e in p.last_turn.cascade["escalations"]] == [reason]
+    kept = p.last_turn.draft_attempt
+    attempts = sorted({a for k, a, _ in events if k == "delta"})
+    abandoned = [a for k, a, _ in events if k == "abandon"]
+    assert attempts == [1, 2] and abandoned == [1] and kept == 2
+    assert _drafts(events, 1) == cheap_says and _drafts(events, 2) == "我怀疑3号"
+    # the retraction reaches watchers before the strong model's first fragment
+    assert events.index(("abandon", 1, next(t for k, a, t in events if k == "abandon"))) < \
+        next(i for i, (k, a, _) in enumerate(events) if a == 2)
+
+
+def test_a_refused_cheap_speech_is_retracted_when_the_strong_retry_starts():
+    env, turn = _turn("speak")
+    events: list[tuple[str, int, str]] = []
+    other = _other(turn.actor)
+    cheap = Tier("cheap", [("speak", {"content": f"{other}号说过他是预言家，我觉得他在骗人。"})])
+    strong = Tier("strong", [("speak", {"content": "我怀疑3号"})])
+    p = _streaming_player(cheap, strong, events)
+    assert _act(p, env, turn)["args"]["content"] == "我怀疑3号"
+    assert p.last_turn.cascade["tier"] == "strong" and p.last_turn.cascade["escalations"]
+    assert [a for k, a, _ in events if k == "abandon"] == [1] and p.last_turn.draft_attempt == 2
+    assert _drafts(events, 2) == "我怀疑3号"
+
+
+def test_a_streaming_flaky_seat_still_makes_mistakes_to_escalate_on():
+    """Online seats always stream; the cheap mock must misbehave on that path too."""
+    from ..players.providers.base import CancelToken
+    escalated = kept = 0
+    for seed in range(4):
+        env, turn = _turn("speak")
+        events: list[tuple[str, int, str]] = []
+        p = LLMPlayer(FlakyMockClient(seed=seed, bad_rate=0.9), strong_client=MockClient(seed=seed, name="mock-strong"),
+                      cascade=CascadePolicy.from_mode("on-fail"), guard=GuardStack(("L1", "L2", "L3")),
+                      on_draft=lambda k, a, t, ev=events: ev.append((k, a, t)))
+        p.cancel = CancelToken()
+        action = p.act(env.observe(turn.actor), turn.task, env.action_space(turn.actor, turn.task), None)
+        escalated += bool(p.last_turn.cascade["escalations"])
+        attempts = {a for k, a, _ in events if k == "delta"}
+        abandoned = [a for k, a, _ in events if k == "abandon"]
+        last = p.last_turn.draft_attempt
+        assert len(abandoned) == len(set(abandoned))
+        for a in attempts:
+            assert (a in abandoned) != (a == last)
+        if last is not None:
+            kept += 1
+            assert _drafts(events, last) == action["args"]["content"]
+    assert escalated >= 2 and kept >= 1
+
+
 # ------------------------------------------------------------ the mock tiers
 
 def test_the_flaky_mock_is_deterministic_and_makes_each_kind_of_mistake():

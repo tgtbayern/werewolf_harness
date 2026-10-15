@@ -209,3 +209,29 @@ def test_sse_for_spectators_carries_only_public_events(client_factory):
     for e in got:
         if e["kind"] in ("phase", "turn") and e.get("task") in ("night", "pack_chat", "pack_plan"):
             raise AssertionError(f"a private task leaked: {e}")
+
+
+def test_a_cascade_game_is_created_over_http_and_counts_its_escalations(client_factory):
+    # docs/adr/0014: every AI seat starts on the cheap tier and moves to the strong one in-turn
+    c = client_factory()
+    h, _ = _guest(c)
+    bad = [({"cheap": "mock-flaky"}, "cheap 和 strong"),                         # one tier missing
+           ({"cheap": "mock-flaky", "strong": "mock-strong", "mode": "sometimes"}, "sometimes"),
+           ({"cheap": "deepseek-v4-pro", "strong": "mock-strong"}, "deepseek-v4-pro")]   # a tier nobody serves
+    for cascade, why in bad:
+        r = c.post("/api/games", json={"variant": "8p", "models": ["mock"], "human_seats": [], "cascade": cascade},
+                   headers=h)
+        assert r.status_code == 400 and why in r.text, r.text
+    r = c.post("/api/games", json={"variant": "8p", "models": ["mock"], "human_seats": [], "seed": 11,
+                                   "cascade": {"cheap": "mock-flaky", "strong": "mock-strong", "mode": "both"}},
+               headers=h)
+    assert r.status_code == 201, r.text
+    game = r.json()
+    assert game["cascade"]["mode"] == "both" and "级联" in game["model"]
+    assert game["models"] == ["mock-flaky", "mock-strong"]
+    # the counts live on the live table: read them while the game is still being played
+    s = _wait(c, game["id"], lambda s: s["game"].get("cascade", {}).get("turns", 0) >= 12)
+    st = s["game"]["cascade"]
+    assert 0 < st["strong_turns"] <= st["turns"] and st["strong_calls"] <= st["calls"]
+    assert st["escalations"].get("decisive")                      # votes and night actions start strong
+    assert set(st["escalations"]) - {"decisive"}, st              # and the flaky cheap tier failed somewhere
