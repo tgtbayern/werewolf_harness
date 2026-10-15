@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     llm_tpm: dict[str, int] = {}
     llm_default_tpm: int = 2_000_000
 
+    # overload protection (runtime/load.py, runtime/admission.py; docs/adr/0011)
+    admission: bool = True              # off = every game starts at once, whatever the load
+    max_queued_games: int = 50          # waiting queue; beyond it creation gets 503 + Retry-After
+    max_active_games: int = 0           # hard cap on games driven by this node (0 = only the load signal)
+    admission_probe_s: float = 5.0      # while busy (exit < pressure < enter): at most one start per this
+    load_tick_s: float = 0.5            # how often the load signal is sampled and the queue drained
+    overload_wait_s: float = 2.0        # observed or expected wait of a model job this long = pressure 1
+    overload_demand_per_slot: float = 1.0  # smoothed model jobs wanting a slot, per slot = pressure 1
+    overload_latency_ms: float = 20_000.0  # recent p50 per-call model latency = pressure 1
+    overload_enter: float = 1.0
+    overload_exit: float = 0.7
+    overload_hold_s: float = 3.0
+    overload_per_game_tau_s: float = 20.0  # smoothing of the jobs-per-game estimate (load.py)
+    fair_queuing: bool = True           # LocalExecutor: per-game fair order instead of one FIFO
+    per_game_asks: int = 4              # Streams executor: model jobs one game may have in the queue at once
+
     # api
     rate_limit_per_min: int = 240       # per IP, all routes
     create_limit_per_hour: int = 30     # per user, POST /api/games

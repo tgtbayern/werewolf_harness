@@ -47,6 +47,7 @@ const state = {
   game: null, seat: null, picked: null, draft: "", tool: null, args: {},
   es: null, ws: null, conn: "—", sending: false, feedTab: "flow", log: null, lastEv: -1, acks: {}, retry: 0,
   reviewSeen: false, sayRound: null, voteRound: null,
+  queued: null,          // a table this browser created that is waiting in line: {id, seat, queue} | {refused, retry_after}
 };
 
 /* ─────────────────────────────────────────────── routing */
@@ -58,7 +59,7 @@ function route() {
 window.addEventListener("hashchange", route);
 
 /* ─────────────────────────────────────────────── lobby */
-const FILTERS = [["all", "全部"], ["running", "进行中"], ["waiting", "等待入座"], ["over", "已结束"]];
+const FILTERS = [["all", "全部"], ["running", "进行中"], ["waiting", "等待入座"], ["queued", "排队中"], ["over", "已结束"]];
 const CLOCKS = [[120, "2 分钟"], [300, "5 分钟"], [600, "10 分钟"], [0, "不限"]];
 const GUARD_WHY = {
   "无": "不装防护：别人的发言原样进入 AI 的上下文。作对照组用。",
@@ -130,6 +131,49 @@ async function refreshGames() {
   const r = await api("/api/games");
   state.games = r.games || [];
   renderGames();
+  refreshLoad();
+  pollQueued();
+}
+
+/* Overload protection (docs/adr/0011). When the model layer is overloaded a new
+ * table is not started but put in line ("queued"); the lobby shows where it is
+ * and starts it -- by opening it -- once the server has let it in. */
+const LOAD_LABEL = { ok: "负载正常", busy: "负载偏高", overloaded: "过载 · 新桌排队" };
+
+async function refreshLoad() {
+  let l;
+  try { l = await api("/api/load"); } catch (e) { return; }
+  const b = $("#load-badge");
+  if (!l || !l.level) { b.hidden = true; return; }
+  b.hidden = false;
+  b.className = "loadbadge " + l.level;
+  const q = (l.admission && l.admission.queued_games) || 0;
+  b.textContent = LOAD_LABEL[l.level] + (q ? ` · ${q} 桌在排队` : "");
+  b.title = `负载 ${Math.round(l.pressure * 100)}% · 模型任务排队 ${l.queued_jobs} · 运行中 ${l.inflight}/${l.capacity}`;
+}
+
+const queueText = (q) => `当前排队中：第 ${q.position} 位，预计 ${q.eta_s} 秒`;
+
+function renderQueued() {
+  const box = $("#queue-banner");
+  const q = state.queued;
+  if (!q) { box.hidden = true; return; }
+  box.hidden = false; box.textContent = "";
+  if (q.refused) {
+    box.append(el("div", null, `服务器正忙，排队的桌子已经满了，请 ${q.retry_after} 秒后再开。`));
+    return;
+  }
+  box.append(el("div", null, `${q.id} · ${queueText(q.queue)}`),
+             el("div", "sub", "模型那边慢下来了：正在进行的牌局优先，新桌按先来后到开局。轮到你时会自动进桌。"));
+}
+
+async function pollQueued() {
+  const q = state.queued;
+  if (!q || q.refused) return;
+  const r = await api(`/api/games/${q.id}/queue`);
+  if (r.state === "queued" && r.queue) { q.queue = r.queue; renderQueued(); return; }
+  state.queued = null; renderQueued();
+  if (r.state && r.state !== "queued") location.hash = `#/g/${q.id}` + (q.seat ? `?seat=${q.seat}` : "");
 }
 
 function renderGames() {
@@ -166,12 +210,14 @@ function renderGames() {
     row.append(h);
     const a = el("button", "chip", g.human_seats.length ? "进桌" : "观战");
     a.onclick = () => { location.hash = `#/g/${g.id}` + (g.human_seats.length ? `?seat=${g.human_seats[0]}` : ""); };
+    if (g.state === "queued") { a.textContent = "排队中"; a.disabled = true; a.title = g.queue ? queueText(g.queue) : ""; }
     row.append(a);
     box.append(row);
   }
 }
 
-const progressOf = (g) => g.state === "over" ? `已结束 · ${g.outcome ? (g.outcome.winner === "wolf" || g.outcome.winner === "werewolf" ? "狼胜" : "村民胜") : "—"}`
+const progressOf = (g) => g.state === "queued" ? (g.queue ? `排队中 · 第 ${g.queue.position} 位` : "排队中")
+  : g.state === "over" ? `已结束 · ${g.outcome ? (g.outcome.winner === "wolf" || g.outcome.winner === "werewolf" ? "狼胜" : "村民胜") : "—"}`
   : g.state === "waiting" ? "等待开局"
   : g.state === "aborted" ? "已作废" : g.state === "crashed" ? "崩了"
   : `第 ${g.round} ${g.phase.startsWith("night") || g.phase.startsWith("pack") ? "夜" : "天"}`;
@@ -235,10 +281,22 @@ async function createGame() {
   const f = state.form;
   $("#create").disabled = true;
   await ensureUser();
-  const g = await api("/api/games", { method: "POST", body: JSON.stringify({
-    variant: f.variant, models: f.models, guard: f.guard, playbook: "static", xray: f.xray,
-    human_seats: [f.seat], turn_seconds: f.clock || null }) });
+  // not api(): the status matters here -- 202 means queued, 503 means the line is full
+  const r = await fetch("/api/games", { method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${store.get("wh.user")}` },
+    body: JSON.stringify({
+      variant: f.variant, models: f.models, guard: f.guard, playbook: "static", xray: f.xray,
+      human_seats: [f.seat], turn_seconds: f.clock || null }) });
+  const g = await r.json();
   $("#create").disabled = false;
+  if (r.status === 503) {
+    state.queued = { refused: true, retry_after: g.retry_after || parseInt(r.headers.get("Retry-After") || "30", 10) };
+    renderQueued(); return;
+  }
+  if (r.status === 202 && g.state === "queued") {
+    state.queued = { id: g.id, seat: f.seat, queue: g.queue };
+    renderQueued(); refreshGames(); return;
+  }
   if (g.id) location.hash = `#/g/${g.id}?seat=${f.seat}`;
 }
 

@@ -52,7 +52,8 @@
 ```
 app/api/       REST + WebSocket + SSE，鉴权，限流，排行榜
 app/auth/      JWT（user / seat）
-app/runtime/   Table（状态与读模型）、GameActor、TimingWheel、Leases、Runtime（创建/接管/续约/排空）、规则座位
+app/runtime/   Table（状态与读模型）、GameActor、TimingWheel、Leases、Runtime（创建/接管/续约/排空）、规则座位、
+               过载信号 load.py + 准入排队 admission.py（ADR 0011）
 app/llm/       gateway（回退链、熔断、token 桶、预算、记账）、sim（模拟供应商 + 前缀缓存）、queue + worker
 app/storage/   Store（SQL）、迁移
 app/obs/       日志、指标、trace

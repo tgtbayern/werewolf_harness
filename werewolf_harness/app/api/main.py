@@ -24,6 +24,7 @@ from ..config import Settings, get_settings
 from ..obs import logging as olog
 from ..obs import metrics, tracing
 from ..runtime.actor import ActorHooks
+from ..runtime.admission import Overloaded
 from ..runtime.runtime import Runtime
 from ..runtime.table import Table, TableConfig
 from ..storage import Store, migrate
@@ -208,7 +209,16 @@ def _routes(app: FastAPI) -> None:
             return JSONResponse({"ok": False, "error": str(e)}, 503)
         if s.rt.draining:
             return JSONResponse({"ok": False, "draining": True}, 503)
-        return {"ok": db and rd, "node": s.s.node_id, "games": len(s.rt.actors)}
+        lv = s.rt.load_view()
+        # still ready while overloaded: running games need this node; only new ones wait
+        return {"ok": db and rd, "node": s.s.node_id, "games": len(s.rt.actors),
+                "load": {"level": lv["level"], "pressure": lv["pressure"],
+                         "queued_games": lv["admission"]["queued_games"]}}
+
+    @app.get("/api/load")
+    async def load(request: Request):
+        """The overload signal and the admission queue (docs/adr/0011)."""
+        return svc(request).rt.load_view()
 
     @app.get("/metrics", include_in_schema=False)
     async def prom():
@@ -258,6 +268,8 @@ def _routes(app: FastAPI) -> None:
                         "xray": cfg.get("xray", False), "node": g["owner_node"],
                         "health": {"turns": 0, "forced_rate": 0, "usable": True, "forced": 0, "tokens": 0},
                         "created": g["created_at"].timestamp()})
+            if g["state"] == "queued":
+                out[-1]["queue"] = s.rt.queue_info(g["id"])
         return FastJSON({"games": sorted(out, key=lambda x: -x.get("created", 0))})
 
     @app.post("/api/games", status_code=201)
@@ -286,11 +298,33 @@ def _routes(app: FastAPI) -> None:
                           fallbacks=list(body.get("fallbacks") or []), routing=body.get("routing") or None,
                           lane=body.get("lane"), lang=body.get("lang") if body.get("lang") in ("zh", "en") else "zh")
         try:
-            a = await s.rt.create(cfg, seed=int(body.get("seed") or 0) or None, created_by=user["id"])
+            decision, a, queued = await s.rt.request(cfg, seed=int(body.get("seed") or 0) or None, created_by=user["id"])
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+        except Overloaded as e:
+            # the waiting line is full: say so, and when to come back (docs/adr/0011)
+            return JSONResponse({"error": "服务器正忙，排队的桌子已经满了，请稍后再开", "retry_after": e.retry_after_s,
+                                 "load": s.rt.load_view()}, 503, headers={"Retry-After": str(e.retry_after_s)})
         metrics.GAMES_CREATED.inc()
+        if a is None:
+            return FastJSON({"id": queued["game_id"], "state": "queued", "queue": queued,
+                             "human_seats": cfg.human_seats, "variant": cfg.variant}, 202)
         return a.t.summary()
+
+    @app.get("/api/games/{gid}/queue")
+    async def queue_position(request: Request, gid: str):
+        """A queued game's place in line; once it has started, its state."""
+        s = svc(request)
+        info = s.rt.queue_info(gid)
+        if info is not None:
+            return {"id": gid, "state": "queued", "queue": info}
+        t = s.rt.table(gid)
+        if t is not None:
+            return {"id": gid, "state": t.state}
+        row = await s.store.get_game(gid)
+        if row is None:
+            raise HTTPException(404, "no such game")
+        return {"id": gid, "state": row["state"]}
 
     @app.post("/api/games/resume", status_code=201)
     async def resume_saved(request: Request, body: dict, user: dict = Depends(current_user)):

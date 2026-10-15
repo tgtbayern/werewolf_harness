@@ -3,7 +3,8 @@
 It plays like the offline MockClient (same legal choices) and adds what a real
 provider has and the mock does not:
 
-  latency       log-normal around `median_ms` (model latency is long-tailed)
+  latency       log-normal around `median_ms` (model latency is long-tailed);
+                injectable at run time through a LatencyControl (slow mode)
   faults        a fraction of calls time out, return 429, or return 5xx
   prefix cache  block-hash prefix caching, the rule OpenAI/DeepSeek/vLLM use:
                 the prompt is cut into fixed blocks (128 tokens); a block counts as
@@ -80,12 +81,45 @@ class PrefixCache:
         return total_tokens, min(cached, total_tokens)
 
 
+class LatencyControl:
+    """Inject a provider slowdown at run time: every SimClient that shares this
+    object scales its latency by `scale`, or uses `median_ms` instead of its own
+    profile when that is set. The overload benchmark flips it mid-run
+    (0.3 s -> 3 s per call) to play a provider that suddenly slows down.
+
+    The process-wide default is CONTROL; SIM_LATENCY_SCALE / SIM_MEDIAN_MS in the
+    environment set its starting values, so a worker process can be started slow.
+    """
+
+    def __init__(self, scale: float = 1.0, median_ms: float | None = None):
+        self.scale = scale
+        self.median_ms = median_ms
+
+    def set(self, *, scale: float | None = None, median_ms: float | None = None) -> None:
+        if scale is not None:
+            self.scale = scale
+        self.median_ms = median_ms
+
+    def apply(self, own_median_ms: float) -> float:
+        return (self.median_ms if self.median_ms is not None else own_median_ms) * self.scale
+
+    @classmethod
+    def from_env(cls) -> LatencyControl:
+        import os
+        m = os.environ.get("SIM_MEDIAN_MS")
+        return cls(float(os.environ.get("SIM_LATENCY_SCALE") or 1.0), float(m) if m else None)
+
+
+CONTROL = LatencyControl.from_env()
+
+
 class SimClient(LLMClient):
     tool_mode = "native"
 
     def __init__(self, seed: int = 0, *, name: str = "sim", median_ms: float = 0.0, sigma: float = 0.6,
                  timeout_rate: float = 0.0, error_rate: float = 0.0, rate_limit_rate: float = 0.0,
-                 cache: PrefixCache | None = None, tools_first: bool = True, sleep: bool = True):
+                 cache: PrefixCache | None = None, tools_first: bool = True, sleep: bool = True,
+                 control: LatencyControl | None = None):
         self.name = name
         self.inner = MockClient(seed=seed)
         self.rng = random.Random(seed * 7919 + 1)
@@ -94,6 +128,7 @@ class SimClient(LLMClient):
         self.cache = cache
         self.tools_first = tools_first
         self.sleep = sleep
+        self.control = control if control is not None else CONTROL
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
         r = self.rng.random()
@@ -105,7 +140,8 @@ class SimClient(LLMClient):
             raise ProviderError(f"{self.name}: 429 rate limited", status=429)
         if r < self.timeout_rate + self.rate_limit_rate + self.error_rate:
             raise ProviderError(f"{self.name}: 503 upstream error", status=503)
-        ms = self.median_ms * math.exp(self.rng.gauss(0, self.sigma)) if self.median_ms else 0.0
+        median = self.control.apply(self.median_ms)
+        ms = median * math.exp(self.rng.gauss(0, self.sigma)) if median else 0.0
         if self.sleep and ms:
             time.sleep(ms / 1000)
         resp = self.inner.chat(messages, tools, temperature, max_tokens, timeout)
