@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 
 from .providers.base import ProviderError
+from .providers.recorded import ReplayDivergence
 
 RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
@@ -169,6 +170,8 @@ def call_model(client, messages, tools, *, policy: RecoveryPolicy, stats: Recove
             stats.transport_retries += 1
             policy.sleep(delay)
             delay *= 2
+        except ReplayDivergence:
+            raise                 # a replay that no longer matches its recording is not a flaky model
         except Exception as exc:  # noqa: BLE001 -- a client bug must not kill a game
             stats.errors.append(f"{type(exc).__name__}: {exc}"[:200])
             return None

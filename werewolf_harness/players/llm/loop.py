@@ -22,6 +22,7 @@ from ...arena import ActionSpec
 from ..guard import GuardStack, evidence_mod
 from ..budget import TokenBudget, estimate_messages, estimate_tokens
 from ..providers.base import LLMClient, ToolCall
+from ..providers.recorded import call_scope
 from ..recovery import RecoveryPolicy, RecoveryStats, TransportBudget, call_model
 from .belief import BeliefState
 from .context import ContextBuilder
@@ -125,6 +126,11 @@ class LLMPlayer:
         self._note_error: BaseException | None = None
         self._gen = 0                    # bumped by discard_last(): a note for a discarded turn is dropped
         self._undo: tuple | None = None
+        # Every act() gets a number, discarded ones included: (seat, act number, kind) names
+        # each model call independently of thread timing, which is what a recording is keyed
+        # by (providers/recorded.py). Calls of one seat never overlap, so this is enough.
+        self.turns_started = 0
+        self._scope: tuple = (0, 0, "")
 
     # ------------------------------------------------------------ after the turn
     def flush(self) -> None:
@@ -159,6 +165,8 @@ class LLMPlayer:
     # ------------------------------------------------------------ the contract
     def act(self, view: dict, task: str, spec: ActionSpec, feedback: str | None) -> Any:
         self.flush()
+        self._scope = (view["you"], self.turns_started, task)
+        self.turns_started += 1
         if self.belief is None:
             self.belief = BeliefState(view["you"], list(range(1, view["num_players"] + 1)))
         if self.registry is None:
@@ -211,7 +219,7 @@ class LLMPlayer:
         while step_no < self.policy.max_react_steps:
             step_no += 1
             step = ReActStep(step_no)
-            response = self._call(messages, schemas, stats)
+            response = self._call(messages, schemas, stats, kind="step")
             if response is None:
                 stats.fallback_used = "transport_failure"
                 if self.transport_budget is not None:
@@ -361,7 +369,7 @@ class LLMPlayer:
         if stats.fallback_used != "transport_failure":
             wanted = _WANTED.get(task, "night action")
             messages.append({"role": "user", "content": f"[guard] You are out of steps. Reply with exactly one `{wanted}` call now."})
-            response = self._call(messages, [t.openai_schema() for t in spec.tools], stats)
+            response = self._call(messages, [t.openai_schema() for t in spec.tools], stats, kind="forced")
             if response is not None and response.tool_calls:
                 call = response.tool_calls[0]
                 term = spec.tool(call.name)
@@ -379,20 +387,21 @@ class LLMPlayer:
     # ------------------------------------------------------------ note to the next turn
     def _note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats) -> None:
         if not self.async_note:
-            self._write_note(messages, result, stats, self._gen)
+            self._write_note(messages, result, stats, self._gen, self._scope)
             return
-        msgs, gen = list(messages), self._gen
+        msgs, gen, scope = list(messages), self._gen, self._scope
 
         def work():
             try:
-                self._write_note(msgs, result, stats, gen)
+                self._write_note(msgs, result, stats, gen, scope)
             except BaseException as exc:          # noqa: BLE001 -- re-raised by the seat's next flush()
                 if gen == self._gen:
                     self._note_error = exc
         self._note_thread = threading.Thread(target=work, name=f"note-{result.player_id}", daemon=True)
         self._note_thread.start()
 
-    def _write_note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats, gen: int) -> None:
+    def _write_note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats, gen: int,
+                    scope: tuple | None = None) -> None:
         """One extra call on the turn's own transcript: the model tells its next turn why.
 
         The environment records what the seat did and the belief table records
@@ -400,7 +409,7 @@ class LLMPlayer:
         the ReAct chain. No tools are offered, so the reply is text. A failed or
         empty reply keeps the previous note rather than blanking it.
         """
-        response = self._call(messages + [{"role": "user", "content": NOTE_PROMPT}], None, stats)
+        response = self._call(messages + [{"role": "user", "content": NOTE_PROMPT}], None, stats, kind="note", scope=scope)
         if gen != self._gen:
             return                                   # the turn it belonged to was thrown away
         if response is not None:
@@ -412,6 +421,10 @@ class LLMPlayer:
             if text:
                 self.note = text[:NOTE_MAX_CHARS]
         result.note_after = self.note
+        # The note's own retries count toward the turn. Written again here because with
+        # async_note act() snapshots the stats while the note may still be running, and
+        # whether a note-call retry made it into the log depended on which thread won.
+        result.recovery = stats.to_dict()
 
     def _file(self, result: TurnResult, step: ReActStep) -> None:
         """Record a step and let anyone watching see it as it happens.
@@ -426,7 +439,8 @@ class LLMPlayer:
             pass
 
     # ------------------------------------------------------------ one model call, metered
-    def _call(self, messages: list[dict], schemas: list[dict] | None, stats: RecoveryStats):
+    def _call(self, messages: list[dict], schemas: list[dict] | None, stats: RecoveryStats, kind: str = "step",
+              scope: tuple | None = None):
         """Every model call goes through here so nothing is spent unmetered.
 
         The request is measured from the strings we are about to send, before it
@@ -434,8 +448,10 @@ class LLMPlayer:
         counts are recorded beside ours and never used for the cap.
         """
         sent = estimate_messages(messages, schemas)
-        response = call_model(self.client, messages, schemas, policy=self.policy, stats=stats,
-                              temperature=self.temperature, max_tokens=self.max_tokens)
+        seat, turn, task = scope or self._scope
+        with call_scope(seat, turn, task, kind):
+            response = call_model(self.client, messages, schemas, policy=self.policy, stats=stats,
+                                  temperature=self.temperature, max_tokens=self.max_tokens)
         if self.token_budget is not None:
             got = estimate_tokens(getattr(response, "text", "") or "")
             for call in getattr(response, "tool_calls", None) or []:

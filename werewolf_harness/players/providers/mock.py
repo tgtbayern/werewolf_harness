@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import random
 import re
+import threading
+import time
 
-from .base import LLMClient, LLMResponse, ToolCall
+from .base import LLMClient, LLMResponse, ProviderError, ToolCall
 
 _SELF = re.compile(r"You are player (\d+), role: (\w+)")
 _ROUND = re.compile(r"=== (?:ROUND|NIGHT) (\d+)")
@@ -23,12 +25,15 @@ class MockClient(LLMClient):
     name = "mock"
     tool_mode = "native"
 
-    def __init__(self, seed: int = 0, info_rate: float = 0.5, latency_ms: int = 2):
+    def __init__(self, seed: int = 0, info_rate: float = 0.5, latency_ms: int = 2, sleep_ms: int = 0):
         self.seed = seed
         self.info_rate = info_rate
         self.latency_ms = latency_ms
+        self.sleep_ms = sleep_ms          # really wait this long per call: a stand-in for a model's latency
 
     def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+        if self.sleep_ms:
+            time.sleep(self.sleep_ms / 1000)
         system = messages[0]["content"] if messages else ""
         prompt = "\n".join(m.get("content") or "" for m in messages)
         me = int(_SELF.search(system).group(1)) if _SELF.search(system) else 0
@@ -75,3 +80,44 @@ class MockClient(LLMClient):
                 wolves = [me] + ([int(x) for x in m.group(1).split(",") if x.strip()] if m else [])
                 out[k] = {str(w): "shenshui" for w in wolves}
         return out
+
+
+class ChaosMockClient(MockClient):
+    """A mock that behaves like a real model in the ways that make games hard to reproduce.
+
+    Its choices come from an unseeded generator, so two runs of the same seed play
+    different games (as a model at temperature > 0 does); it sleeps a random time,
+    so seats finish in a different order every run; and it sometimes fails --
+    a retryable 503, a malformed reply, an empty reply. Only a recording can
+    replay a game played against it, which is what it exists to test.
+    """
+
+    name = "mock-chaos"
+
+    def __init__(self, seed: int = 0, error_rate: float = 0.08, malformed_rate: float = 0.08,
+                 max_sleep_ms: int = 8, rng: random.Random | None = None):
+        super().__init__(seed=seed)
+        self.name = "mock-chaos"
+        self.error_rate = error_rate
+        self.malformed_rate = malformed_rate
+        self.max_sleep_ms = max_sleep_ms
+        self._rng = rng or random.Random()             # deliberately not derived from the game seed
+        self._lock = threading.Lock()
+
+    def chat(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0) -> LLMResponse:
+        with self._lock:
+            roll, nap, salt = self._rng.random(), self._rng.random(), self._rng.randrange(1 << 30)
+        time.sleep(nap * self.max_sleep_ms / 1000)
+        if roll < self.error_rate:
+            raise ProviderError("mock-chaos: upstream 503", status=503, hint="模拟的上游故障")
+        if roll < self.error_rate + self.malformed_rate:
+            return LLMResponse(text="嗯……我想想", latency_ms=int(nap * self.max_sleep_ms), model=self.name)
+        # a fresh draw every call: the base mock keys its choices on its seed
+        r = MockClient(seed=salt, info_rate=self.info_rate).chat(messages, tools, temperature, max_tokens, timeout)
+        r.latency_ms = int(nap * self.max_sleep_ms)
+        r.model = self.name
+        if r.tool_calls and tools is None:
+            r.tool_calls = []
+        if not r.tool_calls and tools is None:
+            r.text = f"记一下：第 {salt % 7} 号可疑。"
+        return r
