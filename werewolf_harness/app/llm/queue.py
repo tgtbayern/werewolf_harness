@@ -34,6 +34,13 @@ acknowledged = in flight), and the capacity the live workers announce in
 Jobs carry only (game, seat, version, task, memory). The worker rebuilds the
 exact view and legal actions by replaying the journal (a few ms), so nothing
 un-serialisable crosses the wire and a job can never act on a world that moved on.
+
+Streaming (docs/adr/0009): a speech job's draft pieces go back on the same
+results stream as its result (field "d" instead of "r"), written by one sender
+per job in order, and the result only after the last piece -- so the node sees
+them in the order they were generated and never a piece after its result. A
+node that no longer wants a job (deadline, stopped game) PUBLISHes on
+``llm:cancel``; the worker running it pulls the plug on its model call.
 """
 from __future__ import annotations
 
@@ -52,12 +59,13 @@ from ...arena import Record, Turn
 from ..config import Settings
 from ..obs import logging as olog
 from ..obs import metrics, tracing
-from ..runtime.agents import AgentJob, AgentResult, run_agent_turn
+from ..runtime.agents import AgentJob, AgentResult, DraftMsg, run_agent_turn
 from ..runtime.load import LatencyWindow, LoadSample
 
 LANES = ("human", "online", "offline")
 GROUP = "workers"
 WORKERS_KEY = "llm:workers"           # hash: consumer -> {"capacity", "ts"}, refreshed by each worker
+CANCEL_CHANNEL = "llm:cancel"
 log = olog.get("llm.queue")
 
 
@@ -131,9 +139,34 @@ class StreamExecutor:
         fields = {"game_id": job.game_id, "seat": job.seat, "version": job.version, "task": job.task,
                   "memory": json.dumps(job.memory, ensure_ascii=False) if job.memory else "",
                   "reply_to": self.node, "enq": time.time(), "lane": job.lane,
+                  "stream": "1" if job.stream else "0", "job_id": job.job_id,
                   "tp": json.dumps(tracing.to_carrier(job.trace_ctx)) if job.trace_ctx is not None else ""}
         asyncio.get_running_loop().create_task(
             self.r.xadd(jobs_key(job.lane), fields, maxlen=100_000, approximate=True))
+
+    def cancel(self, job: AgentJob, reason: str) -> None:
+        """Stop a job. One still held on this node (per-game cap) never goes out. One in
+        the stream: tell whichever worker runs it to stop it -- fire-and-forget; a worker
+        that has not taken it yet remembers the cancel and drops it with a stale reply,
+        which gives the game's slot back. If nobody hears it, the result is dropped as
+        stale anyway."""
+        q = self.held.get(job.game_id)
+        if q and any(j is job for j in q):
+            kept = deque(j for j in q if j is not job)
+            if kept:
+                self.held[job.game_id] = kept
+            else:
+                self.held.pop(job.game_id, None)
+            return
+        msg = json.dumps({"job_id": job.job_id, "game_id": job.game_id, "seat": job.seat, "version": job.version,
+                          "reason": reason})
+        asyncio.get_running_loop().create_task(self._publish_cancel(msg))
+
+    async def _publish_cancel(self, msg: str) -> None:
+        try:
+            await self.r.publish(CANCEL_CHANNEL, msg)
+        except Exception:                                  # noqa: BLE001 -- a lost cancel costs tokens, not correctness
+            log.warning("could not publish a cancel")
 
     async def _results(self) -> None:
         key = results_key(self.node)
@@ -148,12 +181,19 @@ class StreamExecutor:
             for _stream, entries in got or []:
                 for eid, f in entries:
                     self._last_id = eid
+                    piece = f.get(b"d", f.get("d"))
+                    if piece is not None:                  # a draft piece, not a result
+                        m = json.loads(_s(piece))
+                        fn = self.deliver.get(m.get("game_id"))
+                        if fn:
+                            fn(DraftMsg(**{k: m[k] for k in DraftMsg.__dataclass_fields__ if k in m}))
+                        continue
                     d = json.loads(_s(f[b"r"] if b"r" in f else f["r"]))
                     self.inflight = max(0, self.inflight - 1)
                     self._settle(d["game_id"], int(d["seat"]), int(d["version"]))
                     if d.get("stale"):
                         continue                           # the worker dropped it: only its slot comes back
-                    if (d.get("meta") or {}).get("ms") is not None:
+                    if (d.get("meta") or {}).get("ms") is not None and not d["meta"].get("cancelled"):
                         self.latency.record(d["meta"]["ms"])
                     fn = self.deliver.get(d["game_id"])
                     if fn:
@@ -228,6 +268,10 @@ class Worker:
         self.waits: dict[str, list[float]] = {x: [] for x in LANES}   # ms each job sat in the queue
         self._tasks: set[asyncio.Task] = set()
         self._stop = False
+        self.running: dict[str, AgentJob] = {}            # job_id -> the job this worker is running
+        self.cancelled = 0
+        self._cancel_early: dict[str, float] = {}         # cancels for jobs not started (here) yet
+        self.drafts_sent = 0
 
     async def ensure_groups(self) -> None:
         for lane in LANES:
@@ -241,6 +285,7 @@ class Worker:
         await self.ensure_groups()
         reclaim = asyncio.create_task(self._reclaim_loop())
         beat = asyncio.create_task(self._announce_loop())
+        self._tasks.add(asyncio.create_task(self._cancel_loop()))
         try:
             while not self._stop:
                 await self.sem.acquire()
@@ -272,6 +317,8 @@ class Worker:
 
     async def stop(self) -> None:
         self._stop = True
+        for job in list(self.running.values()):
+            job.cancel.cancel("worker stopping")      # unacked: another worker claims it and runs it again
         for t in list(self._tasks):
             t.cancel()
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -334,16 +381,81 @@ class Worker:
             self.stale += 1                               # the world moved on; the actor no longer wants this
             return None
         mem = json.loads(f["memory"]) if f.get("memory") else None
+        key = f.get("job_id") or f"{gid}:{seat}:{version}"
+        if self._cancel_early.pop(key, None) is not None:
+            self.stale += 1                               # cancelled while it sat in the queue
+            return None
         job = AgentJob(gid, seat, version, t.task, table.env.observe(seat), table.env.action_space(seat, t.task),
                        tuple(mem) if mem else None,
                        make_player=lambda on_step: table.make_player(seat, task=t.task, version=version),
-                       trace_ctx=tracing.from_carrier(json.loads(f["tp"])) if f.get("tp") else None)
-        res = await asyncio.get_running_loop().run_in_executor(self.pool, run_agent_turn, job)
+                       trace_ctx=tracing.from_carrier(json.loads(f["tp"])) if f.get("tp") else None,
+                       stream=f.get("stream") == "1", job_id=key)
+        loop = asyncio.get_running_loop()
+        sender = None
+        if job.stream:
+            pieces: asyncio.Queue = asyncio.Queue()
+            job.publish = lambda m: loop.call_soon_threadsafe(pieces.put_nowait, m)
+            sender = asyncio.create_task(self._send_drafts(pieces, results_key(f["reply_to"])))
+        self.running[key] = job
+        try:
+            res = await loop.run_in_executor(self.pool, run_agent_turn, job)
+        finally:
+            self.running.pop(key, None)
+            if sender is not None:
+                # the turn's own thread flushed its last piece before returning, and those
+                # call_soon_threadsafe puts ran before this await resumed: the queue is complete
+                pieces.put_nowait(None)
+                await sender
         self.done += 1
         res.meta["remote"] = True
         res.meta["worker"] = self.consumer
         return {"game_id": gid, "seat": seat, "version": version, "action": res.action, "forced": res.forced,
                 "memory": list(res.memory) if res.memory else None, "meta": res.meta, "error": res.error}
+
+    async def _send_drafts(self, pieces: asyncio.Queue, key: str) -> None:
+        """One job's draft pieces onto the results stream, strictly in order."""
+        while True:
+            m = await pieces.get()
+            if m is None:
+                return
+            try:
+                await self.r.xadd(key, {"d": json.dumps(m.to_dict(), ensure_ascii=False)}, maxlen=10_000,
+                                  approximate=True)
+                self.drafts_sent += 1
+            except Exception:                              # noqa: BLE001 -- a lost piece leaves a gap the node refuses
+                log.warning("could not send a draft piece")
+
+    async def _cancel_loop(self) -> None:
+        """Cancels from the nodes. Pub/sub, not a stream: a cancel nobody hears costs tokens, not correctness."""
+        while not self._stop:
+            ps = self.r.pubsub()
+            try:
+                await ps.subscribe(CANCEL_CHANNEL)
+                while not self._stop:
+                    msg = await ps.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if msg and msg.get("type") == "message":
+                        self._on_cancel(json.loads(_s(msg["data"])))
+            except asyncio.CancelledError:
+                raise
+            except Exception:                              # noqa: BLE001 -- redis blip: resubscribe
+                await asyncio.sleep(0.5)
+            finally:
+                try:
+                    await ps.aclose()
+                except Exception:                          # noqa: BLE001
+                    pass
+
+    def _on_cancel(self, d: dict) -> None:
+        key = d.get("job_id") or f"{d['game_id']}:{d['seat']}:{d['version']}"
+        job = self.running.get(key)
+        if job is not None:
+            self.cancelled += 1
+            job.cancel.cancel(d.get("reason") or "cancelled")
+            return
+        now = time.monotonic()
+        self._cancel_early[key] = now
+        for k in [k for k, t0 in self._cancel_early.items() if now - t0 > 600]:
+            del self._cancel_early[k]
 
     async def _reclaim_loop(self) -> None:
         """Jobs a dead worker took and never acknowledged: claim them after they sit idle."""

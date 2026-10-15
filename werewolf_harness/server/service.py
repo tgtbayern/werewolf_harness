@@ -22,6 +22,7 @@ from ..players import (BudgetExhausted, GatewayExhausted, GuardStack, HumanPlaye
                        MockClient, OpenAICompatClient, RandomPlayer, RecoveryPolicy, TokenBudget,
                        TransportBudget)
 from ..players.providers import PROVIDERS, ClaudeCLIClient, is_cli_model, provider_of, profile, retired
+from ..players.providers.mock import STREAM_PROFILES
 
 _ids = itertools.count(1)
 
@@ -79,8 +80,8 @@ def _client(model: str, seed: int, env_keys: dict):
     its own body quirks), and the local Claude Code CLI (`claude-cli:<model>`,
     no key -- whatever the CLI is signed in with). The seat cannot tell the difference.
     """
-    if model == "mock":
-        return MockClient(seed=seed)
+    if model == "mock" or model in STREAM_PROFILES:
+        return MockClient.named(model, seed)
     if is_cli_model(model):
         return ClaudeCLIClient(model, env=env_keys)
     p = profile(model)
@@ -96,7 +97,8 @@ def _client(model: str, seed: int, env_keys: dict):
         base = env_keys.get("LLM_BASE_URL", "https://api.openai.com/v1")
     return OpenAICompatClient(model, api_key=key, base_url=base, tool_mode=p["tool_mode"],
                               tool_choice=p.get("tool_choice", "required"),
-                              extra_body=p.get("extra_body"), temperature=p.get("temperature"))
+                              extra_body=p.get("extra_body"), temperature=p.get("temperature"),
+                              stream=p.get("stream", True))
 
 
 @dataclass

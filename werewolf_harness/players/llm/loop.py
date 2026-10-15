@@ -21,11 +21,12 @@ from typing import Any
 from ...arena import ActionSpec
 from ..guard import GuardStack, evidence_mod
 from ..budget import TokenBudget, estimate_messages, estimate_tokens
-from ..providers.base import LLMClient, ToolCall
+from ..providers.base import Cancelled, CancelToken, LLMClient, ToolCall
 from ..providers.recorded import call_scope
 from ..recovery import RecoveryPolicy, RecoveryStats, TransportBudget, call_model
 from .belief import BeliefState
 from .context import ContextBuilder
+from .streaming import SPEECH_TOOLS, SpeechStream, expect_record, savings
 from .tools import InfoRegistry, SemanticError, ToolContext, build_registry
 
 _RECORD_TOOLS = {"query_history", "query_votes", "query_deaths"}
@@ -78,6 +79,7 @@ class TurnResult:
     recovery: dict = field(default_factory=dict)
     model: str = ""
     note_ms: int = 0                 # the part of latency_ms spent writing the note
+    draft_attempt: int | None = None  # which streamed draft became this turn's action (see on_draft)
 
     @property
     def fallback_used(self) -> str | None:
@@ -85,6 +87,10 @@ class TurnResult:
 
     def to_dict(self) -> dict:
         d = {k: v for k, v in self.__dict__.items() if k != "steps"}
+        if d.get("draft_attempt") is None:
+            # only a streamed turn has one; a log written without streaming (every log from
+            # before it, and every CLI game) stays byte-identical, so replay-llm compares equal
+            d.pop("draft_attempt", None)
         d["react_trace"] = [s.to_dict() for s in self.steps]
         return d
 
@@ -94,8 +100,20 @@ class LLMPlayer:
                  temperature: float = 0.7, max_tokens: int = 700, playbook: bool = True, forensics_gate: bool = False,
                  transport_budget: TransportBudget | None = None, anonymise_speakers: bool = False,
                  registry: InfoRegistry | None = None, token_budget: TokenBudget | None = None,
-                 on_step=None, lang: str = "zh", async_note: bool = False):
+                 on_step=None, lang: str = "zh", async_note: bool = False, on_draft=None,
+                 cancel: CancelToken | None = None):
         self.client = client
+        # Streaming speech (docs/adr/0009). on_draft(kind, attempt, text) is told, while a
+        # speech-like terminal is still being generated, what of its `content` has arrived
+        # ("delta"), and when an attempt will not be the turn's answer after all ("abandon":
+        # the guard refused it, the stream was reset, the turn fell back). Every attempt it
+        # hears about ends in exactly one of: an abandon, or `last_turn.draft_attempt`.
+        # Like on_step it is a watcher: nothing the seat decides depends on it.
+        self.on_draft = on_draft
+        self.cancel = cancel             # set from outside to stop the turn, and the call in flight
+        self._attempts = 0
+        self._open_attempt: int | None = None
+        self._speechy = False
         self.lang = lang
         self.guard = guard or GuardStack()
         self.policy = policy or RecoveryPolicy()
@@ -176,9 +194,12 @@ class LLMPlayer:
         stats = RecoveryStats()
         self.last_forced = False
         self._undo = (copy.deepcopy(self.belief), self.note, len(self.history))
+        self._speechy = self.on_draft is not None and any(t.name in SPEECH_TOOLS for t in spec.tools)
         try:
             action = self._run(view, task, spec, feedback, result, stats)
         finally:
+            if self._open_attempt is not None:     # the turn ended on something other than that speech
+                self._abandon(stats.fallback_used or "turn ended")
             # A fallback is a legal action, which is exactly why it has to be
             # flagged: without this the journal reads a turn the harness filled
             # in as a move the model chose, and the 兜底率 stays 0% while the
@@ -299,6 +320,7 @@ class LLMPlayer:
                 self._file(result, step)
                 if call.name in ("speak", "campaign_run", "last_words"):
                     result.hallucinated_citations = evidence_mod.unsupported_citations(args["content"], speaker=view["you"], lookups=lookups)
+                result.draft_attempt = self._take_attempt(call.name)
                 self._note(messages, result, stats)
                 return {"name": call.name, "args": args}
 
@@ -375,6 +397,7 @@ class LLMPlayer:
                 term = spec.tool(call.name)
                 if term is not None and not call.malformed and term.check(call.arguments) is None:
                     self._file(result, ReActStep(step_no + 1, action="<forced>", args=dict(call.arguments)))
+                    result.draft_attempt = self._take_attempt(call.name)
                     self._note(messages, result, stats)
                     return {"name": call.name, "args": term.normalise(call.arguments)}
         stats.fallback_used = stats.fallback_used or "default_action"
@@ -433,10 +456,45 @@ class LLMPlayer:
         does depends on whether anyone is watching.
         """
         result.steps.append(step)
+        if step.guard_blocked and self._open_attempt is not None:
+            self._abandon(f"guard:{step.block_reason}")      # refused: what was shown will not be said
         try:
             self.on_step(result.player_id, step)
         except Exception:                                  # noqa: BLE001 -- a watcher must never break a turn
             pass
+
+    # ------------------------------------------------------------ drafts (streamed speech)
+    def _draft(self, kind: str, attempt: int, text: str = "") -> None:
+        try:
+            self.on_draft(kind, attempt, text)
+        except Exception:                                  # noqa: BLE001 -- a watcher must never break a turn
+            pass
+
+    def _abandon(self, reason: str) -> None:
+        attempt, self._open_attempt = self._open_attempt, None
+        if attempt is not None and self.on_draft is not None:
+            self._draft("abandon", attempt, reason)
+
+    def abandon_draft(self, attempt: int | None, reason: str) -> None:
+        """The caller refused the action this attempt became (run_agent_turn's re-check)."""
+        if attempt is not None and self.on_draft is not None:
+            self._draft("abandon", attempt, reason)
+
+    def _take_attempt(self, name: str) -> int | None:
+        """The open draft becomes the turn's answer -- if the answer is the speech it streamed."""
+        attempt, self._open_attempt = self._open_attempt, None
+        if attempt is not None and name not in SPEECH_TOOLS:
+            self._draft("abandon", attempt, f"not a speech: {name}")
+            return None
+        return attempt
+
+    def _speech_stream(self) -> SpeechStream:
+        def on_text(text: str) -> None:
+            if self._open_attempt is None:
+                self._attempts += 1
+                self._open_attempt = self._attempts
+            self._draft("delta", self._open_attempt, text)
+        return SpeechStream(on_text, self._abandon)
 
     # ------------------------------------------------------------ one model call, metered
     def _call(self, messages: list[dict], schemas: list[dict] | None, stats: RecoveryStats, kind: str = "step",
@@ -448,10 +506,24 @@ class LLMPlayer:
         counts are recorded beside ours and never used for the cap.
         """
         sent = estimate_messages(messages, schemas)
+        if self._open_attempt is not None:
+            self._abandon("retry")                 # a new call means the last one's speech was not used
+        stream = self._speech_stream() if self._speechy and schemas else None
+        # `kind` names the call in a recording (step | forced | note) and must not depend on
+        # whether anyone watches; the savings estimate classes calls by what they cost instead.
+        cost_kind = "note" if schemas is None else "speech" if stream is not None else "step"
         seat, turn, task = scope or self._scope
-        with call_scope(seat, turn, task, kind):
-            response = call_model(self.client, messages, schemas, policy=self.policy, stats=stats,
-                                  temperature=self.temperature, max_tokens=self.max_tokens)
+        try:
+            with call_scope(seat, turn, task, kind):
+                response = call_model(self.client, messages, schemas, policy=self.policy, stats=stats,
+                                      temperature=self.temperature, max_tokens=self.max_tokens,
+                                      on_delta=stream.feed if stream is not None else None, cancel=self.cancel)
+        except Cancelled as exc:
+            exc.saved = savings(self.client.name, cost_kind, exc.produced, sent, note_pending=cost_kind != "note",
+                                max_tokens=self.max_tokens)
+            raise
+        if response is not None:
+            expect_record(self.client.name, cost_kind, response.completion_tokens)
         if self.token_budget is not None:
             got = estimate_tokens(getattr(response, "text", "") or "")
             for call in getattr(response, "tool_calls", None) or []:

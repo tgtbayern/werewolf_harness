@@ -93,6 +93,45 @@ class Event:
         return {"seq": self.seq, "kind": self.kind, "ts": round(self.ts, 3), **self.data}
 
 
+# Turns whose answer is spoken text and may be streamed as a draft, and who may
+# watch it: "public" (everyone, like the turn itself), "wolves" (the pack channel).
+DRAFT_AUDIENCE = {"speak": "public", "last_words": "public", "campaign": "public", "review": "public",
+                  "pack_chat": "wolves"}
+DRAFT_LOG_MAX = 4000
+
+
+@dataclass
+class Draft:
+    """A speech still being generated: shown, not yet said. Never persisted."""
+    id: str
+    seat: int
+    seq: int                         # the journal version the turn was asked at
+    task: str
+    audience: str
+    run: str
+    attempt: int
+    asked_at: float
+    text: str = ""
+    first_at: float | None = None
+    last_at: float | None = None
+
+
+@dataclass
+class DraftEvent:
+    """One draft message. Its own sequence (dseq), outside the journal-derived `events`:
+    drafts are not replayed, so they must not shift the seq a reconnecting client
+    resumes from. `at` = len(events) when emitted, which orders it against them."""
+    dseq: int
+    kind: str                        # draft | draft_commit | draft_retract | draft_reset
+    audience: str
+    at: int
+    data: dict
+    ts: float = field(default_factory=time.time)
+
+    def to_dict(self, epoch: int) -> dict:
+        return {"dseq": self.dseq, "kind": self.kind, "epoch": epoch, "ts": round(self.ts, 3), **self.data}
+
+
 class Table:
     def __init__(self, game_id: str, seed: int, cfg: TableConfig, env_keys: dict | None = None,
                  created: float | None = None, hub=None):
@@ -129,6 +168,17 @@ class Table:
         self.recoveries = 0
         self.asked_ahead = 0                  # model turns asked before they were due
         self.misses = 0                       # ... whose answer could not be used and was asked again
+        # Streaming drafts (docs/adr/0009). Live only: an incarnation (fencing token = epoch)
+        # starts with none, and says so with a draft_reset before anything else.
+        self.draft_epoch = 0
+        self.drafts: dict[str, Draft] = {}
+        self.draft_log: list[DraftEvent] = []
+        self.draft_base = 0                   # dseq of draft_log[0]
+        self.draft_closed: dict[str, dict] = {}       # recently closed: id -> its commit/retract event
+        self.draft_timings: list[dict] = []   # per committed/retracted draft: ms to first char, to the end
+        self.draft_stats = {"opened": 0, "committed": 0, "retracted": 0, "deltas": 0,
+                            "cancelled_turns": 0, "tokens_saved": 0, "tokens_saved_cut": 0,
+                            "tokens_saved_skipped": 0}
 
         # Which model sits where: round-robin over a seeded shuffle (as before), so a
         # mixed table does not always hand seat 1 the same model.
@@ -257,6 +307,126 @@ class Table:
         for line in news:
             self.emit("news", text=line)
 
+    # ------------------------------------------------------------ drafts (streamed speech)
+    # Only the actor calls the draft_* writers, like every other writer here. The
+    # invariant they keep: every draft id that appears in a `draft` event is closed by
+    # exactly one `draft_commit` (whose text is the journal's text for that turn) or
+    # `draft_retract` -- or, for an epoch that died, by the next epoch's `draft_reset`.
+    def _draft_emit(self, kind: str, audience: str, **data) -> DraftEvent:
+        ev = DraftEvent(self.draft_base + len(self.draft_log), kind, audience, len(self.events), data)
+        self.draft_log.append(ev)
+        if len(self.draft_log) > DRAFT_LOG_MAX:
+            cut = len(self.draft_log) - DRAFT_LOG_MAX
+            del self.draft_log[:cut]
+            self.draft_base += cut
+        return ev
+
+    def draft_open(self, seat: int, seq: int, task: str, run: str, attempt: int, asked_at: float) -> Draft:
+        d = Draft(f"d{self.draft_epoch}.{seq}.{seat}.{run}.{attempt}", seat, seq, task,
+                  DRAFT_AUDIENCE.get(task, "private"), run, attempt, asked_at)
+        self.drafts[d.id] = d
+        self.draft_stats["opened"] += 1
+        return d
+
+    def draft_delta(self, d: Draft, offset: int, text: str) -> bool:
+        """Append `text` at `offset`. A repeat is dropped, an overlap trimmed; a gap is refused."""
+        have = len(d.text)
+        if offset > have or not text:
+            return False
+        if offset < have:
+            text = text[have - offset:]
+            if not text:
+                return False
+            offset = have
+        now = time.time()
+        d.first_at = d.first_at or now
+        d.last_at = now
+        d.text += text
+        self.draft_stats["deltas"] += 1
+        self._draft_emit("draft", d.audience, draft_id=d.id, seat=d.seat, seq=d.seq, task=d.task,
+                         offset=offset, delta=text)
+        return True
+
+    def draft_commit(self, d: Draft, text: str, n: int) -> None:
+        """The turn was journalled: what is shown becomes exactly `text`, the journal's."""
+        self.drafts.pop(d.id, None)
+        self.draft_stats["committed"] += 1
+        ev = self._draft_emit("draft_commit", d.audience, draft_id=d.id, seat=d.seat, seq=d.seq, task=d.task,
+                              n=n, text=text)
+        self._draft_close(d, ev, "committed")
+
+    def draft_retract(self, d: Draft, reason: str) -> None:
+        self.drafts.pop(d.id, None)
+        self.draft_stats["retracted"] += 1
+        ev = self._draft_emit("draft_retract", d.audience, draft_id=d.id, seat=d.seat, seq=d.seq, task=d.task,
+                              reason=reason)
+        self._draft_close(d, ev, "retracted")
+
+    def draft_reset(self, reason: str) -> None:
+        """A new incarnation: every draft an earlier epoch showed is void."""
+        self._draft_emit("draft_reset", "public", reason=reason)
+
+    def _draft_close(self, d: Draft, ev: DraftEvent, outcome: str) -> None:
+        self.draft_closed[d.id] = {"ev": ev}
+        while len(self.draft_closed) > 400:
+            self.draft_closed.pop(next(iter(self.draft_closed)))
+        now = time.time()
+        self.draft_timings.append({"seat": d.seat, "task": d.task, "outcome": outcome, "chars": len(d.text),
+                                   "first_ms": round((d.first_at - d.asked_at) * 1000, 1) if d.first_at else None,
+                                   "last_ms": round((d.last_at - d.asked_at) * 1000, 1) if d.last_at else None,
+                                   "close_ms": round((now - d.asked_at) * 1000, 1)})
+        del self.draft_timings[:-2000]
+
+    def note_cancelled(self, saved: dict | None) -> None:
+        self.draft_stats["cancelled_turns"] += 1
+        saved = saved or {}
+        self.draft_stats["tokens_saved"] += int(saved.get("total", 0))
+        self.draft_stats["tokens_saved_cut"] += int(saved.get("cut", 0))
+        self.draft_stats["tokens_saved_skipped"] += int(saved.get("skipped", 0))
+
+    def draft_visible(self, audience: str, seat: int | None) -> bool:
+        """Who may watch a draft: the same rule as the turn it belongs to (adr/0007)."""
+        if audience == "public" or self.may_see_all(seat):
+            return True
+        if audience == "wolves" and seat:
+            return getattr(self.env, "_roles", {}).get(seat) == "werewolf"
+        return False
+
+    @property
+    def dseq(self) -> int:
+        """The dseq the next draft event will get."""
+        return self.draft_base + len(self.draft_log)
+
+    def draft_events(self, after: int, seat: int | None) -> list[DraftEvent] | None:
+        """Draft events with dseq > `after` this reader may see; None if they were trimmed away."""
+        if after + 1 < self.draft_base:
+            return None
+        return [e for e in self.draft_log[max(0, after + 1 - self.draft_base):] if self.draft_visible(e.audience, seat)]
+
+    def drafts_view(self, seat: int | None) -> list[dict]:
+        return [{"draft_id": d.id, "seat": d.seat, "seq": d.seq, "task": d.task, "text": d.text}
+                for d in self.drafts.values() if d.text and self.draft_visible(d.audience, seat)]
+
+    def draft_sync(self, seat: int | None, known: dict[str, int] | None = None) -> list[dict]:
+        """Bring a client that lost the thread up to date: each open draft from the offset it
+        already has, and the outcome of each draft it knows that is no longer open."""
+        known = dict(known or {})
+        out: list[dict] = []
+        for d in self.drafts.values():
+            if not d.text or not self.draft_visible(d.audience, seat):
+                continue
+            off = max(0, min(int(known.pop(d.id, 0) or 0), len(d.text)))
+            out.append({"kind": "draft", "epoch": self.draft_epoch, "draft_id": d.id, "seat": d.seat, "seq": d.seq,
+                        "task": d.task, "offset": off, "delta": d.text[off:], "sync": True})
+        for did in known:
+            closed = self.draft_closed.get(did)
+            if closed and self.draft_visible(closed["ev"].audience, seat):
+                out.append({**closed["ev"].to_dict(self.draft_epoch), "sync": True})
+            else:                               # an id from another epoch, or one long gone
+                out.append({"kind": "draft_retract", "epoch": self.draft_epoch, "draft_id": did,
+                            "reason": "lost", "sync": True})
+        return out
+
     # ------------------------------------------------------------ news (public facts only)
     def _snap(self) -> dict:
         e = self.env
@@ -328,7 +498,7 @@ class Table:
                 "asked_ahead": self.asked_ahead, "misses": self.misses,
                 "recoveries": self.recoveries, "transport_failures": self.transport.failures,
                 "tokens": self.tokens.total_tokens, "max_tokens": self.tokens.max_tokens,
-                "gateway_drift": self.tokens.drift()}
+                "gateway_drift": self.tokens.drift(), "drafts": dict(self.draft_stats)}
 
     def summary(self, seat: int | None = None) -> dict:
         alive = sorted(self.env._alive) if hasattr(self.env, "_alive") else []
@@ -372,6 +542,9 @@ class Table:
             if log is not None and seat in log:
                 out["my_record"] = list(log[seat])
         out["log"] = [e.to_dict() for e in self.events[-60:]]
+        # what is being said right now (a polling client's copy of the draft stream)
+        out["drafts"] = self.drafts_view(seat)
+        out["draft_epoch"], out["dseq"] = self.draft_epoch, self.dseq
         return out
 
     def full_log(self, seat: int | None = None) -> dict:

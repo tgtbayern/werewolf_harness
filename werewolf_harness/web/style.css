@@ -384,6 +384,14 @@ main.table { grid-template-rows: auto minmax(0, 1fr); }
 .fl.live .fw { color: var(--live); }
 .fl.live.mine { background: #f3e6d4; border-color: var(--you); }
 .fl.end { background: var(--ink); color: var(--paper); margin-top: 10px; }
+/* drafts: a speech still being generated (docs/adr/0009) */
+.draft.open .dtext { color: #8d8378; }
+.draft .typing { font-family: var(--mono); font-size: 10.5px; font-weight: 400; color: var(--live); margin-left: 4px; }
+.draft .caret { display: inline-block; width: 2px; height: 1em; margin-left: 2px; vertical-align: -2px;
+                background: var(--live); animation: wh-caret 1s steps(1) infinite; }
+.draft.retracted .dnote { color: var(--muted); font-style: italic; font-size: 12px; }
+.draft.retracted { opacity: .75; }
+@keyframes wh-caret { 50% { opacity: 0; } }
 .fl.end .fw { color: #e0b877; }
 .feed { max-height: none; min-height: 320px; }
 .turn .rowhead { background: transparent; position: static; margin: 0; padding: 0; }

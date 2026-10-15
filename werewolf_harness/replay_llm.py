@@ -122,7 +122,10 @@ def load(path: str, cassette: str | None = None) -> tuple[dict, Cassette]:
     return log, Cassette.load(cpath)
 
 
-def replay_game(log: dict, cas: Cassette, *, allow_drift: bool = False, upto: int | None = None) -> ReplayReport:
+def replay_game(log: dict, cas: Cassette, *, allow_drift: bool = False, upto: int | None = None,
+                on_player=None) -> ReplayReport:
+    """Re-run the recorded game on the recorded replies. `on_player(player)` may adjust each
+    seat before play (tests stream the replay through drafts with it)."""
     s = settings_of(log)
     n = VARIANTS[log["variant"]].num_players
     rep = ReplayReport(recorded=len(cas.calls))
@@ -133,6 +136,9 @@ def replay_game(log: dict, cas: Cassette, *, allow_drift: bool = False, upto: in
         return clients[seat]
 
     players, _tokens, _guard = build_players(s, n, client_for, policy_for=lambda _seat: no_wait_policy())
+    for p in players.values():
+        if on_player is not None:
+            on_player(p)
     # the rules the game was recorded under (a log from before versioning = baseline): the
     # rules text is part of every prompt, so a different version would drift every call
     env = Werewolf(log["variant"], playbook_mode=s["playbook"], engine_version=engine_version_of(log))
@@ -173,11 +179,22 @@ def compare(log: dict, rep: ReplayReport, *, upto: int | None = None) -> list[st
         if len(got) != len(exp):
             out.append(f"回合记录条数不同：录制 {len(exp)} / 回放 {len(got)}")
         for a, b in zip(exp, got):
+            a, b = _decided(a), _decided(b)
             if a != b:
                 keys = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
                 out.append(f"座位 {a.get('player_id')} 第 {a.get('round')} 轮 {a.get('task')} 的回合记录不同：{keys}")
                 break
     return out
+
+
+# What a turn record says about who was watching rather than what the seat decided:
+# draft_attempt exists only when the speech was streamed to someone (docs/adr/0009), so
+# a game recorded while streaming and replayed without it (or the reverse) is the same game.
+_WATCHER_FIELDS = ("draft_attempt",)
+
+
+def _decided(t: dict) -> dict:
+    return {k: v for k, v in t.items() if k not in _WATCHER_FIELDS} if any(k in t for k in _WATCHER_FIELDS) else t
 
 
 def check_expectations(rep: ReplayReport, expects: list[str]) -> list[str]:

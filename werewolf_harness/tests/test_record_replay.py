@@ -13,7 +13,8 @@ from werewolf_harness.cli import main as cli_main
 from werewolf_harness.envs import Werewolf
 from werewolf_harness.players.llm import loop
 from werewolf_harness.players.providers import recorded
-from werewolf_harness.players.providers.base import LLMClient, LLMResponse, ProviderError, ToolCall
+from werewolf_harness.players.providers.base import (Cancelled, CancelToken, Delta, LLMClient, LLMResponse,
+                                                     ProviderError, ToolCall, collect)
 from werewolf_harness.players.providers.mock import ChaosMockClient, MockClient
 from werewolf_harness.players.providers.recorded import (Cassette, CassetteWriter, RecordingClient, ReplayClient,
                                                         ReplayDivergence, call_scope)
@@ -38,8 +39,11 @@ class Jitter(LLMClient):
 
 
 def record_game(tmp_path, name, make_client, *, variant="8p", seed=3, parallel=8, settings=None,
-                engine_version=None):
-    """What `play --record --out` does, returning the log dict and its path."""
+                engine_version=None, on_draft=None):
+    """What `play --record --out` does, returning the log dict and its path.
+
+    on_draft: stream the seats' speech as the online service does (a cancel token and a
+    draft watcher on every seat), so the calls go through chat_stream."""
     s = dict(SETTINGS, parallel=parallel, **(settings or {}))
     out = str(tmp_path / f"{name}.json")
     w = CassetteWriter(recorded.cassette_path_for(out), meta={"variant": variant, "seed": seed})
@@ -47,6 +51,9 @@ def record_game(tmp_path, name, make_client, *, variant="8p", seed=3, parallel=8
                                        lambda seat: RecordingClient(make_client(seat), w, seat=seat))
     for p in players.values():                     # no real backoff in tests
         p.policy.sleep = lambda _s: None
+        if on_draft is not None:
+            p.cancel = CancelToken()
+            p.on_draft = (lambda seat: lambda kind, attempt, text: on_draft(seat, kind, attempt, text))(p)
     env = Werewolf(variant, playbook_mode=s["playbook"], engine_version=engine_version)
     t0 = time.time()
     ep = run(env, players, seed, parallel=parallel)
@@ -296,3 +303,89 @@ def test_online_table_records_when_asked(tmp_path, monkeypatch):
     assert all(k.startswith(f"{turn.actor}/0.0/{turn.task}/") for k in c.calls)
     off = Table("gOFF", 7, TableConfig(variant="8p"))
     assert off.cassette() is None
+    # the service streams every model seat (a cancel token on each job): same lines on the cassette
+    ts = Table("gRECs", 7, TableConfig(variant="8p", record=True))
+    ts.reset()
+    ps = ts.make_player(turn.actor, task=turn.task, version=0)
+    ps.cancel, ps.on_draft = CancelToken(), lambda *a: None
+    ps.act(ts.env.observe(turn.actor), turn.task, ts.env.action_space(turn.actor, turn.task), None)
+    cs = Cassette.load(str(tmp_path / "cas" / "gRECs.cassette.jsonl"))
+    assert {k: v["h"] for k, v in cs.calls.items()} == {k: v["h"] for k, v in c.calls.items()}
+
+
+# ------------------------------------------------------------------ streaming (docs/adr/0009)
+def test_a_game_recorded_while_streaming_replays_identically(tmp_path):
+    """Streaming is delivery, not content: the cassette of a streamed game has the same keys
+    and request hashes as the same game played without streaming, and it replays (through
+    the non-streaming path) to the same journal and turn records."""
+    drafts: list = []
+    mk = lambda s: MockClient(seed=60 + s, speech_tokens=40, chunk_tokens=3)      # noqa: E731
+    log_s, path_s = record_game(tmp_path, "streamed", mk, on_draft=lambda *a: drafts.append(a))
+    log_p, path_p = record_game(tmp_path, "plain", mk)
+    assert sum(1 for d in drafts if d[1] == "delta") > 20, "the speech should have been streamed in pieces"
+    assert keys_and_hashes(recorded.cassette_path_for(path_s)) == keys_and_hashes(recorded.cassette_path_for(path_p))
+    assert log_s["journal"] == log_p["journal"]
+    log2, cas = load(path_s)
+    rep = replay_game(log2, cas)
+    assert compare(log2, rep) == []
+    assert rep.used == set(cas.calls)
+
+
+def test_a_streamed_game_replays_through_the_streaming_path(tmp_path):
+    """And the other way round: the replay itself streamed (seats with drafts on)."""
+    log, path = record_game(tmp_path, "s2", lambda s: ChaosMockClient(seed=s, rng=random.Random(70 + s)),
+                            parallel=1, seed=4, on_draft=lambda *a: None)
+    log2, cas = load(path)
+    seen: list = []
+    rep = replay_game(log2, cas, on_player=lambda p: (setattr(p, "cancel", CancelToken()),
+                                                      setattr(p, "on_draft", lambda *a: seen.append(a))))
+    assert compare(log2, rep) == []
+    assert any(d[0] == "delta" for d in seen)
+
+
+class _SlowStream(LLMClient):
+    name = "slow"
+
+    def __init__(self, stall: float):
+        self.stall = stall
+
+    def chat(self, *a, **k):
+        return LLMResponse(text="hi")
+
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0, cancel=None):
+        yield Delta("text", "h")
+        if cancel.wait(self.stall):
+            raise Cancelled(cancel.reason or "cancelled", 1)
+        yield Delta("text", "i")
+        yield LLMResponse(text="hi", completion_tokens=1)
+
+
+def test_streamed_calls_record_the_same_lines_as_chat(tmp_path, monkeypatch):
+    monkeypatch.setattr(recorded, "_hard_deadline", lambda t: 0.3)
+    monkeypatch.setattr(recorded, "RECORD_SLACK_S", 0.1)
+    path = str(tmp_path / "s.cassette.jsonl")
+    w = CassetteWriter(path)
+    msgs = [{"role": "user", "content": "x"}]
+    got = []
+    with call_scope(1, 0, "speak", "step"):
+        pieces: list = []
+        got.append(collect(RecordingClient(_SlowStream(0.0), w, seat=1).chat_stream(msgs), pieces.append))
+        assert [p.text for p in pieces] == ["h", "i"]
+        with pytest.raises(ProviderError, match="timed out"):          # past the deadline: the plug is pulled
+            collect(RecordingClient(_SlowStream(5.0), w, seat=1).chat_stream(msgs, cancel=CancelToken()))
+        outer = CancelToken()
+        stream = RecordingClient(_SlowStream(5.0), w, seat=1).chat_stream(msgs, cancel=outer)
+        next(stream)
+        outer.cancel("turn_gone")
+        with pytest.raises(Cancelled):
+            list(stream)
+    w.close()
+    c = Cassette.load(path)
+    assert c.order == ["1/0/speak/0/step", "1/0/speak/1/step", "1/0/speak/2/step"]
+    rp = ReplayClient(c, 1)
+    with call_scope(1, 0, "speak", "step"):
+        assert collect(rp.chat_stream(msgs)).text == got[0].text
+        with pytest.raises(ProviderError, match="timed out"):
+            collect(rp.chat_stream(msgs))
+        with pytest.raises(Cancelled):                                 # comes back as itself, not a look-alike
+            collect(rp.chat_stream(msgs))

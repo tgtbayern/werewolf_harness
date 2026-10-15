@@ -48,7 +48,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from .base import LLMClient, LLMResponse, ProviderError, ToolCall
+from .base import Cancelled, CancelToken, LLMClient, LLMResponse, ProviderError, ToolCall
 
 FORMAT = 1
 
@@ -145,7 +145,9 @@ def error_to_dict(exc: BaseException) -> dict:
             "hint": getattr(exc, "hint", None), "provider": isinstance(exc, ProviderError)}
 
 
-_ERROR_TYPES: dict[str, type] = {}
+# Errors that must come back as themselves, not as a look-alike class: Cancelled is
+# not a ProviderError, and recovery.call_model tells it apart by type.
+_ERROR_TYPES: dict[str, type] = {"Cancelled": Cancelled}
 
 
 def error_from_dict(d: dict) -> BaseException:
@@ -376,6 +378,67 @@ class RecordingClient(LLMClient):
             raise
         self.cassette.put(key, req, resp=response_to_dict(resp), wall_ms=int((time.monotonic() - t0) * 1000))
         return resp
+
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0,
+                    cancel: CancelToken | None = None):
+        """Stream from ``inner`` and record what chat() would have recorded.
+
+        Streaming is how a reply is delivered, not what it is: the line written is the
+        final response (or error) under the same key and request hash as a chat() call,
+        so a cassette recorded with streaming on replays through ReplayClient (whose
+        chat_stream is the base default: the recorded reply sent as fragments) and one
+        recorded without streaming replays through the streaming path.
+
+        The deadline is the one chat() enforces, kept the streaming way: at
+        hard deadline - slack this call's own cancel token is pulled and the call is
+        recorded as the same timeout ProviderError. A client that cannot be interrupted
+        finishes late, and is still recorded as that timeout -- the game moved on without
+        its reply. A cancel from outside (the turn is gone) is recorded as an error too,
+        so the per-turn call numbering stays the same as the run that made it.
+        """
+        key, _ = self._key()
+        req = canonical_request(messages, tools, temperature, max_tokens, self.name, self.tool_mode)
+        t0 = time.monotonic()
+        hard = _hard_deadline(timeout)
+        mine = cancel.child() if cancel is not None else CancelToken()
+        fired = threading.Event()
+
+        def expire():
+            fired.set()
+            mine.cancel("deadline")
+        timer = threading.Timer(max(0.05, hard - RECORD_SLACK_S), expire)
+        timer.daemon = True
+        timer.start()
+        late = ProviderError(f"model call timed out after {hard:.0f}s (hard deadline)", status=None)
+        final: LLMResponse | None = None
+        try:
+            for item in self.inner.chat_stream(messages, tools=tools, temperature=temperature,
+                                               max_tokens=max_tokens, timeout=timeout, cancel=mine):
+                if isinstance(item, LLMResponse):
+                    final = item
+                    break
+                if fired.is_set():
+                    raise late
+                yield item
+            if final is None:
+                raise ProviderError("stream ended without a response", status=502)
+            if fired.is_set():
+                raise late
+        except Cancelled as exc:
+            timer.cancel()
+            err: BaseException = late if fired.is_set() and not (cancel is not None and cancel.is_set()) else exc
+            self.cassette.put(key, req, err=error_to_dict(err), wall_ms=int((time.monotonic() - t0) * 1000))
+            if err is exc:
+                raise
+            raise late from exc
+        except BaseException as exc:                       # noqa: BLE001 -- recorded, then re-raised as is
+            timer.cancel()
+            if not isinstance(exc, GeneratorExit):
+                self.cassette.put(key, req, err=error_to_dict(exc), wall_ms=int((time.monotonic() - t0) * 1000))
+            raise
+        timer.cancel()
+        self.cassette.put(key, req, resp=response_to_dict(final), wall_ms=int((time.monotonic() - t0) * 1000))
+        yield final
 
 
 RECORD_SLACK_S = 1.0

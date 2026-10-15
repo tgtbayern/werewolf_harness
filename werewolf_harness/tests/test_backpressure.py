@@ -273,13 +273,69 @@ async def test_load_sample_of_the_local_executor(fake_turn):
     await ex.close()
 
 
+# ------------------------------------------------------------------ cancel (docs/adr/0009) x fair queue
+async def test_cancel_drops_a_queued_job_and_cuts_a_running_one(monkeypatch):
+    def run(job):                                         # a turn that runs until it is cancelled
+        cut = job.cancel.wait(5)
+        return AgentResult(job.game_id, job.seat, job.version, None, True,
+                           meta={"cancelled": job.cancel.reason} if cut else {})
+    monkeypatch.setattr(agents, "run_agent_turn", run)
+    ex = LocalExecutor(1, fair=True)
+    got: list = []
+    done = asyncio.Event()
+
+    def deliver(r):
+        got.append(r)
+        if len(got) == 2:
+            done.set()
+    a1, a2, b = _job("A", seat=1), _job("A", seat=2), _job("B")
+    for j in (a1, a2, b):
+        ex.submit(j, deliver)
+    assert ex.inflight == 1 and ex.load_sample().queued == 2
+    ex.cancel(a2, "turn_gone")                            # still waiting: out of the queue, never runs
+    assert ex.dropped == 1 and ex.load_sample().queued == 1 and a2.cancel.is_set()
+    t0 = time.monotonic()
+    ex.cancel(a1, "timeout")                              # on a thread: its call is cut, B gets the thread
+    while ex.started_order != ["A", "B"]:
+        await asyncio.sleep(0.01)
+    ex.cancel(b, "shutdown")
+    await asyncio.wait_for(done.wait(), 3)
+    assert time.monotonic() - t0 < 1
+    assert [(r.game_id, r.seat, r.meta.get("cancelled")) for r in got] == [("A", 1, "timeout"), ("B", 1, "shutdown")]
+    assert ex.started_order == ["A", "B"] and not ex.waiting and not ex.running
+    await ex.close()
+
+
+async def test_streams_executor_cancel_keeps_a_held_job_from_going_out():
+    import json as _json
+
+    from werewolf_harness.app.config import Settings
+    from werewolf_harness.app.llm.queue import CANCEL_CHANNEL, StreamExecutor
+    r = _FakeRedis()
+    ex = StreamExecutor(r, Settings(), per_game_asks=1)
+    j1, j2 = _job("A", seat=1), _job("A", seat=2)
+    ex.submit(j1, lambda res: None)
+    ex.submit(j2, lambda res: None)                       # held on the node behind the cap
+    ex.cancel(j2, "turn_gone")
+    ex.cancel(j1, "timeout")                              # in the stream: told to the workers
+    await asyncio.sleep(0)
+    ex._settle("A", 1, 5)                                 # j1's (cancelled) answer frees the slot...
+    await asyncio.sleep(0)
+    assert [f["seat"] for _k, f in r.added] == [1]        # ...and j2 does not go out
+    assert [(c, _json.loads(m)["job_id"]) for c, m in r.published] == [(CANCEL_CHANNEL, j1.job_id)]
+
+
 # ------------------------------------------------------------------ streams per-game cap
 class _FakeRedis:
     def __init__(self):
         self.added: list[tuple[str, dict]] = []
+        self.published: list[tuple[str, str]] = []
 
     async def xadd(self, key, fields, **kw):
         self.added.append((key, fields))
+
+    async def publish(self, channel, msg):
+        self.published.append((channel, msg))
 
 
 async def test_streams_executor_caps_jobs_per_game_in_the_stream():

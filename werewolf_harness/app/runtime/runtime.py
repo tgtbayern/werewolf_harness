@@ -317,6 +317,7 @@ class Runtime:
             self.finished.pop(next(iter(self.finished)))
 
     def _actor(self, table: Table, token: int) -> GameActor:
+        table.draft_epoch = token                   # draft ids are unique per incarnation
         a = GameActor(table, store=self.store, executor=self.executor, wheel=self.wheel, token=token,
                       agent_timeout_s=self.s.agent_timeout_s, hooks=self.hooks)
         self.actors[table.id] = a
@@ -399,6 +400,9 @@ class Runtime:
         table.emit("phase", phase="resume", round=getattr(table.env, "_round", 0), turns=len(table.journal),
                    node=self.node)
         actor = self._actor(table, token)
+        # Drafts are not persisted: whatever the last owner was streaming died with it. Say
+        # so first, then the open turns are asked again (docs/adr/0009).
+        table.draft_reset("recovered")
         actor.launch()
         self.counters["adopted"] += 1
         olog.kv(log, 20, "adopted", game_id=gid, steps=len(rows), ms=round((time.monotonic() - t0) * 1000, 1),

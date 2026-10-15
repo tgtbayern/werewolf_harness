@@ -48,6 +48,8 @@ const state = {
   es: null, ws: null, conn: "—", sending: false, feedTab: "flow", log: null, lastEv: -1, acks: {}, retry: 0,
   reviewSeen: false, sayRound: null, voteRound: null,
   queued: null,          // a table this browser created that is waiting in line: {id, seat, queue} | {refused, retry_after}
+  // speech still being generated (docs/adr/0009): id -> {seat, seq, task, text, status, epoch}
+  drafts: {}, draftEpoch: null, dseq: -1,
 };
 
 /* ─────────────────────────────────────────────── routing */
@@ -311,6 +313,7 @@ async function openTable() {
   await pull();
   closeLive();
   state.lastEv = -1;
+  state.drafts = {}; state.draftEpoch = null; state.dseq = -1;
   connectLive();
   window._tick = window._tick || setInterval(tickClock, 1000);
 }
@@ -323,12 +326,19 @@ function connectLive() {
   const gid = state.game; if (!gid) return;
   const tok = state.seat ? store.get(seatKey(gid, state.seat)) : "";
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/ws/games/${gid}?token=${encodeURIComponent(tok || "")}&last_seq=${state.lastEv}`);
+  // Resume both streams: events from the last seq, drafts from the last dseq of the epoch we
+  // were on. A different epoch (the game moved to another node) is answered with a sync.
+  const resume = state.draftEpoch == null ? "" : `&epoch=${state.draftEpoch}&dseq=${state.dseq}`;
+  const ws = new WebSocket(`${proto}//${location.host}/ws/games/${gid}?token=${encodeURIComponent(tok || "")}&last_seq=${state.lastEv}${resume}`);
   state.ws = ws;
   ws.onmessage = (m) => {
     const d = JSON.parse(m.data);
+    if (d.op === "draft") { onDraft(d); return; }
     if (d.op === "hello") {
       state.conn = "已连"; state.retry = 0; renderHealth();
+      // tell the server how much of each open draft we already hold, so a sync sends only the rest
+      ws.send(JSON.stringify({ op: "resume", last_seq: state.lastEv, epoch: state.draftEpoch, dseq: state.dseq,
+                               drafts: openDraftOffsets() }));
       const beat = () => { if (state.ws === ws && ws.readyState === 1) ws.send(JSON.stringify({ op: "ping", t: Date.now() })); };
       clearTimeout(state.beatFirst); clearInterval(state.beat);
       state.beatFirst = setTimeout(() => { beat(); state.beat = setInterval(beat, d.heartbeat_s * 1000); }, Math.random() * d.heartbeat_s * 1000);
@@ -375,8 +385,127 @@ async function pull() {
   if (s.error) { location.hash = "#/"; return; }
   state.s = s;
   state.pulledAt = Date.now();
+  if (state.conn === "轮询") syncDraftsFromState(s);    // no live stream: the snapshot is all we get
   // nothing is opened over the table until you click a seat
   renderTable();
+}
+
+/* ─────────────────────────────────────────────── drafts（正在说…）
+ * While a model seat is still generating a speech, its words arrive as draft
+ * messages and are shown in place, lighter and with a caret. A draft ends one of
+ * two ways, and the server guarantees one of them: `draft_commit` replaces it with
+ * the exact text the journal holds, `draft_retract` takes it back (shown as a short
+ * note for a few seconds). Text arrives at an offset, so a repeated or resynced
+ * message is harmless. Nothing here decides anything; the server already filtered
+ * what this seat may watch (the pack's drafts go to wolves only). */
+const RETRACT_CN = {
+  retry: "重新组织", timeout: "超时，按默认处理", stale: "局面变了，重新想", turn_gone: "这一步取消了",
+  not_said: "没有说出口", shutdown: "服务器换手", recovered: "服务器换手，重新来", lost: "连接中断，重新来",
+  rerun: "重新来", spec: "不合规则，重说", reset: "换了个模型重说", aborted: "这一局中止了",
+};
+const retractCN = (r) => RETRACT_CN[r] || (String(r || "").startsWith("guard") ? "被规则拦下，重说" : "撤回");
+
+function onDraft(m) {
+  if (m.dseq != null && m.epoch === state.draftEpoch) state.dseq = Math.max(state.dseq, m.dseq);
+  const fresh = applyDraft(m);
+  const d = m.draft_id && state.drafts[m.draft_id];
+  // the common case -- more words for a draft already on screen -- touches one node
+  if (!fresh && d && d.status === "open" && m.kind === "draft") {
+    const nodes = document.querySelectorAll(`[data-draft="${CSS.escape(d.id)}"] .dtext`);
+    if (nodes.length) {
+      const scroller = $(".feed"), atEnd = scroller && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+      nodes.forEach((n) => { n.textContent = d.text; });
+      if (atEnd) scroller.scrollTop = scroller.scrollHeight;
+      return;
+    }
+  }
+  scheduleFeed();
+}
+
+function applyDraft(m) {
+  const ds = state.drafts;
+  if (m.kind === "draft_reset" || m.kind === "draft_sync") {
+    for (const d of Object.values(ds)) if (d.status === "open" && d.epoch !== m.epoch) retractLocal(d, m.kind === "draft_reset" ? "recovered" : "lost");
+    state.draftEpoch = m.epoch;
+    if (m.kind === "draft_sync") state.dseq = m.dseq;
+    return true;
+  }
+  let d = ds[m.draft_id];
+  if (m.kind === "draft") {
+    let created = false;
+    if (!d) {
+      if (m.offset) return false;                       // never show a draft from its middle
+      d = ds[m.draft_id] = { id: m.draft_id, seat: m.seat, seq: m.seq, task: m.task, text: "", status: "open",
+                             epoch: m.epoch, t: Date.now() };
+      created = true;
+    }
+    if (d.status !== "open" || m.offset > d.text.length) return false;
+    d.text = d.text.slice(0, m.offset) + (m.delta || "");
+    return created;
+  }
+  if (!d) return false;
+  if (m.kind === "draft_commit") { d.status = "committed"; d.text = m.text; d.n = m.n; }
+  else if (m.kind === "draft_retract" && d.status === "open") retractLocal(d, m.reason);
+  return true;
+}
+
+function retractLocal(d, reason) {
+  d.status = "retracted"; d.reason = reason;
+  setTimeout(() => { if (state.drafts[d.id] === d) { delete state.drafts[d.id]; scheduleFeed(); } }, 5000);
+}
+
+function openDraftOffsets() {
+  const out = {};
+  for (const d of Object.values(state.drafts)) if (d.status === "open") out[d.id] = d.text.length;
+  return out;
+}
+
+/* Polling fallback: the state snapshot carries the open drafts this seat may see. */
+function syncDraftsFromState(s) {
+  const live = new Set();
+  for (const x of s.drafts || []) {
+    live.add(x.draft_id);
+    const d = state.drafts[x.draft_id];
+    if (!d) state.drafts[x.draft_id] = { id: x.draft_id, seat: x.seat, seq: x.seq, task: x.task, text: x.text,
+                                         status: "open", epoch: s.draft_epoch, t: Date.now() };
+    else if (d.status === "open" && x.text.length >= d.text.length) d.text = x.text;
+  }
+  for (const d of Object.values(state.drafts)) if (d.status === "open" && !live.has(d.id)) delete state.drafts[d.id];
+}
+
+function scheduleFeed() {
+  if (state.feedRaf || !state.s) return;
+  state.feedRaf = requestAnimationFrame(() => { state.feedRaf = null; if (state.s && state.game) renderFeed(); });
+}
+
+/* The drafts to draw for a pane: still open, just retracted (the note), or committed
+ * but not yet in the state we last pulled (the speech itself replaces it then). */
+function draftsFor(tasks) {
+  const version = (state.s && state.s.game && state.s.game.version) || 0;
+  return Object.values(state.drafts)
+    .filter((d) => tasks.includes(d.task) && (d.status !== "committed" || d.n == null || d.n > version))
+    .sort((a, b) => a.t - b.t);
+}
+
+function draftRow(d, style) {
+  const mine = d.seat === state.seat;
+  const who = (d.task === "pack_chat" ? "狼频道 · " : "") + (mine ? `你（${d.seat} 号）` : `${d.seat} 号`);
+  const open = d.status === "open";
+  const row = el("div", (style === "sp" ? "sp" : "fl say") + " draft " + d.status + (mine ? " mine" : ""));
+  row.dataset.draft = d.id;
+  const body = el("span", style === "sp" ? "body" : "ft");
+  if (d.status === "retracted") {
+    body.className += " dnote";
+    body.textContent = `撤回了还没说完的话（${retractCN(d.reason)}）`;
+  } else {
+    body.append(el("span", "dtext", d.text));
+    if (open) body.append(el("span", "caret"));
+  }
+  const label = el("span", style === "sp" ? "who" : "fw", who);
+  if (open) label.append(el("span", "typing", " 正在说…"));
+  if (style === "sp") { const h = el("div"); h.append(label); row.append(h, body); }
+  else row.append(label, body);
+  return row;
 }
 
 function renderTable() {
@@ -710,7 +839,8 @@ function renderFeed() {
     ? (state.sayRound == null ? `${all.length} 条 · 共 ${rounds.length} 轮` : `${list.length} 条`)
     : "";
   if (rounds.length > 1) box.append(roundPicker(rounds, "sayRound", renderFeed));
-  if (!all.length) { box.append(el("div", "it", "还没有人发言。")); return; }
+  const saying = state.sayRound == null ? draftsFor(["speak", "last_words", "campaign"]) : [];
+  if (!all.length && !saying.length) { box.append(el("div", "it", "还没有人发言。")); return; }
   let shown = null;
   for (const sp of list) {
     if (sp.round !== shown && state.sayRound == null) {
@@ -724,6 +854,7 @@ function renderFeed() {
     d.append(h, el("div", "body", sp.content));
     box.append(d);
   }
+  for (const d of saying) box.append(draftRow(d, "sp"));
   // Only chase the newest line when you are reading everything; a chosen round
   // should start at its first speech, not its last.
   const scroller = box.closest(".feed");
@@ -754,6 +885,7 @@ function renderFlow() {
   };
   const me = (id) => (id === state.seat ? `你（${id} 号）` : `${id} 号`);
   const live = () => {
+    for (const d of draftsFor(["speak", "last_words", "campaign", "pack_chat"])) box.append(draftRow(d, "fl"));
     if (ended) return;
     const a = s.acting || g.acting;
     if (!a) { add("live", "▶", "裁判正在结算这一步……"); return; }
@@ -885,7 +1017,8 @@ function renderReview() {
   const said = s.review || [];
   $("#spoken").textContent = `${said.length} 条复盘发言`;
   box.append(reviewHead());
-  if (!said.length) {
+  const saying = draftsFor(["review"]);
+  if (!said.length && !saying.length) {
     box.append(el("div", "it", s.game.reviewing ? "牌都翻开了，还没有人开口。" : "这一局没有复盘记录。"));
     return;
   }
@@ -900,6 +1033,7 @@ function renderReview() {
     d.append(h, el("div", "body", e.content));
     box.append(d);
   }
+  for (const d of saying) box.append(draftRow(d, "sp"));
   const scroller = box.closest(".feed"); if (scroller) scroller.scrollTop = scroller.scrollHeight;
 }
 

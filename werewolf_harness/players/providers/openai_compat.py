@@ -22,13 +22,18 @@ mid-experiment:
 from __future__ import annotations
 
 import json
+import socket
 import time
 import http.client
 import urllib.error
 import urllib.request
+from collections.abc import Iterable, Iterator
 
 from .base import (
     JSON_TOOL_INSTRUCTIONS,
+    Cancelled,
+    CancelToken,
+    Delta,
     LLMClient,
     LLMResponse,
     ProviderError,
@@ -36,6 +41,130 @@ from .base import (
     describe_tools_for_prompt,
     parse_json_action,
 )
+
+
+# ------------------------------------------------------------------ SSE
+def iter_sse(lines: Iterable[bytes | str]) -> Iterator[str]:
+    """The `data` payloads of a server-sent-event stream, in order.
+
+    Standard framing (a blank line ends an event; several `data:` lines join with
+    a newline; `:` lines are comments) plus one tolerance relays need: a `data:`
+    line that is a whole JSON object (or `[DONE]`) on its own is yielded at once,
+    so a relay that forgets the blank line between events still streams.
+    Lines are split before they are decoded, so a multi-byte character can never
+    be cut in half by a read boundary.
+    """
+    buf: list[str] = []
+    for raw in lines:
+        line = (raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw).rstrip("\r\n")
+        if not line:
+            if buf:
+                yield "\n".join(buf)
+                buf = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if field != "data":
+            continue
+        if not buf and (value.strip() == "[DONE]" or _whole_json(value)):
+            yield value
+            continue
+        buf.append(value)
+    if buf:
+        yield "\n".join(buf)
+
+
+def _whole_json(s: str) -> bool:
+    s = s.strip()
+    if not (s.startswith("{") and s.endswith("}")):
+        return False
+    try:
+        json.loads(s)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
+class StreamAssembler:
+    """Chat-completion chunks back into one message, emitting fragments on the way.
+
+    Tool calls arrive keyed by `index`: the first chunk of a call carries its id
+    and name, later ones only pieces of the arguments string. Text arrives as
+    `delta.content`. `reasoning_content` (a thinking model's scratchpad) is never
+    emitted -- it is the model's private reasoning, like `thought`.
+    """
+
+    def __init__(self):
+        self.text: list[str] = []
+        self.calls: dict[int, dict] = {}
+        self.finish_reason: str | None = None
+        self.usage: dict = {}
+        self.model: str = ""
+        self.seen = False
+
+    def feed(self, obj: dict) -> list[Delta]:
+        if obj.get("error"):
+            err = obj["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            code = err.get("code") if isinstance(err, dict) else None
+            raise ProviderError(f"stream error: {msg}"[:600], status=int(code) if str(code).isdigit() else 502)
+        self.seen = True
+        self.model = obj.get("model") or self.model
+        if obj.get("usage"):
+            self.usage = obj["usage"]
+        out: list[Delta] = []
+        for ch in obj.get("choices") or []:
+            delta = ch.get("delta") or ch.get("message") or {}
+            if delta.get("content"):
+                self.text.append(delta["content"])
+                out.append(Delta("text", delta["content"]))
+            for tc in delta.get("tool_calls") or []:
+                idx = int(tc.get("index", 0) or 0)
+                slot = self.calls.setdefault(idx, {"id": None, "name": "", "args": []})
+                slot["id"] = tc.get("id") or slot["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name") and not slot["name"]:
+                    slot["name"] = fn["name"]
+                piece = fn.get("arguments")
+                if isinstance(piece, dict):                    # a relay that sends the object, not a string
+                    piece = json.dumps(piece, ensure_ascii=False)
+                if piece:
+                    slot["args"].append(piece)
+                if piece or fn.get("name"):
+                    out.append(Delta("tool", piece or "", slot["name"] or None, idx))
+            if ch.get("finish_reason"):
+                self.finish_reason = ch["finish_reason"]
+        return out
+
+    def message(self) -> dict:
+        calls = [{"id": c["id"] or f"call_{i}", "type": "function",
+                  "function": {"name": c["name"], "arguments": "".join(c["args"])}}
+                 for i, c in sorted(self.calls.items())]
+        return {"content": "".join(self.text), "tool_calls": calls}
+
+    def produced(self) -> int:
+        from ..budget import estimate_tokens
+        return estimate_tokens("".join(self.text) + "".join("".join(c["args"]) for c in self.calls.values()))
+
+
+def _hang_up(resp) -> None:
+    """Shut the socket under a response another thread is blocked reading.
+
+    `close()` alone does not wake a thread inside recv(); `shutdown()` does. The
+    socket is dug out of urllib's response the only way it can be.
+    """
+    sock = None
+    try:
+        sock = resp.fp.raw._sock
+    except AttributeError:
+        sock = getattr(getattr(resp, "fp", None), "_sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
 
 def _as_string_enums(tools: list[dict]) -> list[dict]:
@@ -73,6 +202,7 @@ class OpenAICompatClient(LLMClient):
         schema_dialect: str | None = None,
         extra_body: dict | None = None,
         temperature: float | None = None,
+        stream: bool = True,
     ):
         if not api_key:
             raise ProviderError(
@@ -102,6 +232,9 @@ class OpenAICompatClient(LLMClient):
         # with a 400 -- and which value depends on whether thinking is on. When a
         # profile pins one, it wins over whatever the caller asks for.
         self.temperature = temperature
+        # Whether chat_stream really streams. A relay that mangles streamed tool
+        # calls can be switched to whole replies per profile ("stream": False).
+        self.stream = stream
 
     # ---- transport -------------------------------------------------------
 
@@ -150,21 +283,10 @@ class OpenAICompatClient(LLMClient):
         max_tokens: int = 800,
         timeout: float = 30.0,
     ) -> LLMResponse:
-        payload: dict = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature if self.temperature is not None else temperature,
-            "max_tokens": max_tokens,
-            **self.extra_body,
-        }
-        if tools and self.tool_mode == "native":
-            payload["tools"] = _as_string_enums(tools) if self.schema_dialect == "google" else tools
-            # "required", not "auto": the loop's contract is one tool call per step anyway, and at least
-            # one relay answers "auto" with finish_reason=tool_calls and an EMPTY tool_calls list on the
-            # step after a tool result -- the call is lost and the turn reads as malformed.
-            payload["tool_choice"] = self.tool_choice
-        elif tools:
-            payload["messages"] = _with_json_protocol(messages, tools)
+        # tool_choice "required", not "auto": the loop's contract is one tool call per step anyway, and at
+        # least one relay answers "auto" with finish_reason=tool_calls and an EMPTY tool_calls list on the
+        # step after a tool result -- the call is lost and the turn reads as malformed.
+        payload = self._payload(messages, tools, temperature, max_tokens)
 
         started = time.time()
         data = self._post("/chat/completions", payload, timeout)
@@ -177,17 +299,115 @@ class OpenAICompatClient(LLMClient):
                 f"malformed response: {json.dumps(data)[:300]}",
                 hint="The relay returned no choices; the model name may be wrong.",
             ) from exc
+        return self._response(choice.get("message", {}) or {}, data.get("usage", {}) or {},
+                              choice.get("finish_reason", "stop"), data.get("model", self.model), data, tools,
+                              latency_ms)
 
-        message = choice.get("message", {}) or {}
-        usage = data.get("usage", {}) or {}
+    def _payload(self, messages, tools, temperature, max_tokens) -> dict:
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature if self.temperature is not None else temperature,
+            "max_tokens": max_tokens,
+            **self.extra_body,
+        }
+        if tools and self.tool_mode == "native":
+            payload["tools"] = _as_string_enums(tools) if self.schema_dialect == "google" else tools
+            payload["tool_choice"] = self.tool_choice
+        elif tools:
+            payload["messages"] = _with_json_protocol(messages, tools)
+        return payload
+
+    # ---- streaming -------------------------------------------------------
+
+    def chat_stream(self, messages, tools=None, temperature=0.7, max_tokens=800, timeout=30.0,
+                    cancel: CancelToken | None = None):
+        """`stream: true` over SSE: text and tool-call argument fragments as they arrive.
+
+        `timeout` is per read, as for chat(); the wall-clock deadline is the
+        caller's, enforced by cancelling -- which shuts the socket, so the relay
+        sees the client go and (on every relay we know of) stops generating and
+        stops billing. A profile with ``stream=False`` gets the default
+        one-fragment behaviour instead.
+        """
+        if not self.stream:
+            yield from super().chat_stream(messages, tools, temperature, max_tokens, timeout, cancel)
+            return
+        cancel = cancel or CancelToken()
+        cancel.raise_if()
+        payload = self._payload(messages, tools, temperature, max_tokens)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        started = time.time()
+        acc = StreamAssembler()
+        try:
+            for data in iter_sse(self._stream_lines("/chat/completions", payload, timeout, cancel)):
+                cancel.raise_if(acc.produced())
+                if data.strip() == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue                                   # a keep-alive or a relay's banner
+                yield from acc.feed(obj)
+        except ProviderError:
+            if cancel.is_set():
+                raise Cancelled(cancel.reason or "cancelled", acc.produced()) from None
+            raise
+        cancel.raise_if(acc.produced())
+        if not acc.seen:
+            raise ProviderError("stream closed before any data", status=502,
+                                hint="the relay dropped the stream; retried automatically")
+        message, usage = acc.message(), acc.usage
+        if not usage.get("completion_tokens"):
+            usage = {**usage, "completion_tokens": acc.produced()}     # a relay that omits usage on streams
+        yield self._response(message, usage, acc.finish_reason or "stop", acc.model or self.model,
+                             {"usage": usage, "stream": True}, tools, int((time.time() - started) * 1000))
+
+    def _stream_lines(self, path: str, payload: dict, timeout: float, cancel: CancelToken):
+        url = f"{self.base_url}{path}"
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST", headers={
+            "Content-Type": "application/json", "Accept": "text/event-stream",
+            "Authorization": f"Bearer {self.api_key}", **self.extra_headers})
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:600]
+            raise ProviderError(f"HTTP {exc.code} from {url}: {detail}",
+                                hint=explain(detail, exc.code, self.group, self.model), status=exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"cannot reach {url}: {exc.reason}",
+                                hint="Check the base_url (it usually must end in /v1) and the network.") from exc
+        except (TimeoutError, ConnectionError, OSError, http.client.HTTPException) as exc:
+            raise ProviderError(f"connection to {url} failed: {type(exc).__name__}: {exc}") from exc
+        unhook = cancel.on_cancel(lambda: _hang_up(resp))
+        try:
+            while True:
+                try:
+                    line = resp.readline()
+                except (TimeoutError, ConnectionError, OSError, ValueError, http.client.HTTPException) as exc:
+                    raise ProviderError(f"stream from {url} broke: {type(exc).__name__}: {exc}") from exc
+                if not line:
+                    return
+                yield line
+        finally:
+            unhook()
+            try:
+                resp.close()
+            except Exception:                              # noqa: BLE001
+                pass
+
+    def _response(self, message: dict, usage: dict, finish_reason: str, model: str, raw: dict,
+                  tools, latency_ms: int) -> LLMResponse:
+        """One reply, from a whole JSON body or a reassembled stream alike."""
         response = LLMResponse(
             text=(message.get("content") or "").strip(),
-            prompt_tokens=int(usage.get("prompt_tokens", 0)),
-            completion_tokens=int(usage.get("completion_tokens", 0)),
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
             latency_ms=latency_ms,
-            finish_reason=choice.get("finish_reason", "stop"),
-            model=data.get("model", self.model),
-            raw=data,
+            finish_reason=finish_reason or "stop",
+            model=model,
+            raw=raw,
         )
 
         if self.tool_mode == "native":

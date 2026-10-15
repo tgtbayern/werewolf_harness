@@ -39,7 +39,8 @@ lint:
 	$(PY) -m ruff check app tests/integration scripts loadtest
 bench:
 	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.bench_runtime && $(PY) -m werewolf_harness.scripts.bench_llm \
-	  && $(PY) -m werewolf_harness.scripts.measure_prompt_cache
+	  && $(PY) -m werewolf_harness.scripts.measure_prompt_cache \
+	  && $(PY) -m werewolf_harness.scripts.bench_streaming
 chaos:          ## kill -9 a node mid-game and watch the other one adopt it
 	cd $(ROOT) && $(PY) -m werewolf_harness.scripts.chaos_demo
 load:           ## WebSocket load test against a running server
