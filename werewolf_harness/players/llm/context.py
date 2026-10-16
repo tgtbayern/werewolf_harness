@@ -72,6 +72,7 @@ class ContextBuilder:
         # prefix and hits the provider's prompt cache. The old order put the seat's
         # private identity second, which made the shared prefix end after the rules.
         self.cache_layout = cache_layout
+        self.wolf_hint = ""              # an extra line for werewolves only (an experiment's directive)
 
     # ---------------------------------------------------------------- system
     def system_message(self, view: dict, terminal_names: list[str], info_names: list[str]) -> str:
@@ -105,6 +106,8 @@ class ContextBuilder:
         if "fellow_wolves" in priv:
             others = priv["fellow_wolves"]
             lines.append(f"  Your fellow wolves: {others or 'none left alive'}. Never reveal this.")
+        if self.wolf_hint and view["role"] == "werewolf":
+            lines.append("  " + self.wolf_hint)
         if priv.get("my_tactic"):
             lines.append(f"  The pack's plan is {priv.get('pack_plan')!r} and your assigned tactic is {priv['my_tactic']!r}. "
                          "Call my_assignment to read it in full, and read_board to see whether it still applies.")

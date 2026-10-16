@@ -46,6 +46,13 @@ def settings_of(log: dict) -> dict:
     return s
 
 
+WOLF_HINTS = {
+    # docs/experiments: in 8p the pack has no planning phase and the wolves never claimed seer
+    "hantiao": ("本局狼队的打法是悍跳：狼队里号码最小的那只狼，白天第一次发言时声称自己是预言家，并报出一个查验结果"
+                "（给好人发查杀，或者给队友发金水），与真预言家对跳、争夺好人的信任；另一只狼不要跳，帮他拉票。"),
+}
+
+
 def build_players(s: dict, n: int, client_for, *, policy_for=None, strong_for=None) -> tuple[dict, TokenBudget, GuardStack]:
     """The seats of `cli play`, built from its settings. One builder for play and replay, so
     a replay cannot drift from the run it reproduces by a default someone changed in one place.
@@ -63,9 +70,12 @@ def build_players(s: dict, n: int, client_for, *, policy_for=None, strong_for=No
         return {"strong_client": strong_for(seat), "cascade": cascade} if cascade is not None else {}
     players = {seat: LLMPlayer(client_for(seat), guard=guard, transport_budget=budget, token_budget=tokens,
                                playbook=s["playbook"] != "none", temperature=s["temperature"], lang=s["lang"],
-                               async_note=s["parallel"] > 1,
+                               async_note=s["parallel"] > 1, memory=s.get("memory", True),
                                **({"policy": policy_for(seat)} if policy_for else {}), **tiers(seat))
                for seat in range(1, n + 1)}
+    if s.get("wolf_hint"):
+        for p in players.values():
+            p.context.wolf_hint = WOLF_HINTS[s["wolf_hint"]]
     return players, tokens, guard
 
 

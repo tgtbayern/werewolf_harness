@@ -51,6 +51,13 @@ def play_settings(a: argparse.Namespace) -> dict:
     """What shapes the seats' prompts, saved in the log so `replay-llm` can rebuild them."""
     s = {"guard": a.guard, "evidence": a.evidence, "playbook": a.playbook, "temperature": a.temperature,
          "lang": a.lang, "max_tokens": a.max_tokens, "max_usd": a.max_usd, "parallel": a.parallel}
+    # experiment switches, saved only when on: a log played without them keeps its old settings
+    if getattr(a, "wolf_model", None):
+        s["wolf_model"] = a.wolf_model
+    if getattr(a, "wolf_hint", None):
+        s["wolf_hint"] = a.wolf_hint
+    if getattr(a, "no_memory", False):
+        s["memory"] = False
     policy = cascade_policy(a)
     if policy is not None:
         # only when on: a log played without a cascade keeps exactly the settings it always had
@@ -84,7 +91,14 @@ def cmd_play(a: argparse.Namespace) -> int:
                                                                   "settings": settings,
                                                                   "started": time.time()})
 
-    def client_for(s: int, model: str = a.model, tier: str | None = None):
+    wolves = set()
+    if settings.get("wolf_model"):
+        probe = Werewolf(a.variant, playbook_mode=a.playbook, engine_version=a.engine_version)
+        probe.reset(a.seed)
+        wolves = {int(k) for k, v in probe.ground_truth()["roles"].items() if v == "werewolf"}
+
+    def client_for(s: int, model: str | None = None, tier: str | None = None):
+        model = model or (a.wolf_model if s in wolves else a.model)
         c = _client(model, a.seed * 100 + s)
         return RecordingClient(c, cassette, seat=s, tier=tier) if cassette is not None else c
 
@@ -328,6 +342,9 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--record", action="store_true",
                     help="录下每一次模型调用（请求+回复/错误），写在 --out 旁边的 .cassette.jsonl")
     # model cascade (players/llm/cascade.py, docs/adr/0014): --model is then the cheap tier
+    pl.add_argument("--wolf-model", default=None, dest="wolf_model", help="狼人座位用这个模型，其余座位用 --model")
+    pl.add_argument("--wolf-hint", default=None, dest="wolf_hint", choices=["hantiao"], help="给狼人加一条打法指令")
+    pl.add_argument("--no-memory", action="store_true", dest="no_memory", help="消融：不跨回合保留信念表和笔记")
     pl.add_argument("--strong", default=None, help="级联的强模型（--model 是便宜模型），例如 claude-cli:sonnet")
     pl.add_argument("--cascade", default="off", choices=["off", "on-fail", "decisive", "both"],
                     help="on-fail：便宜模型的回复没过校验（格式/未知工具/非法参数/守卫拦截/无据引用/步数用尽/无应答）"

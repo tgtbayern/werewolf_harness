@@ -118,8 +118,12 @@ class LLMPlayer:
                  registry: InfoRegistry | None = None, token_budget: TokenBudget | None = None,
                  on_step=None, lang: str = "zh", async_note: bool = False, on_draft=None,
                  cancel: CancelToken | None = None, strong_client: LLMClient | None = None,
-                 cascade: CascadePolicy | None = None):
+                 cascade: CascadePolicy | None = None, memory: bool = True):
         self.client = client
+        # memory=False is an ablation: the belief table and the note to the next turn
+        # start empty every turn, so the seat keeps no judgment of its own between turns
+        # (what the environment shows and the history tools return are unchanged).
+        self.memory = memory
         # Model cascade (players/llm/cascade.py): `client` is the cheap tier, `strong_client`
         # the strong one. A turn's transcript is built once and may be continued by either,
         # so both must speak the same tool protocol.
@@ -215,8 +219,10 @@ class LLMPlayer:
         self.flush()
         self._scope = (view["you"], self.turns_started, task)
         self.turns_started += 1
-        if self.belief is None:
+        if self.belief is None or not self.memory:
             self.belief = BeliefState(view["you"], list(range(1, view["num_players"] + 1)))
+        if not self.memory:
+            self.note = ""
         if self.registry is None:
             self.registry = build_registry(playbook=self.playbook, num_players=view["num_players"])
         result = TurnResult(view["you"], view["round"], task, belief_before=self.belief.snapshot(), note_before=self.note,
@@ -485,6 +491,8 @@ class LLMPlayer:
 
     # ------------------------------------------------------------ note to the next turn
     def _note(self, messages: list[dict], result: TurnResult, stats: RecoveryStats) -> None:
+        if not self.memory:
+            return
         if not self.async_note:
             self._write_note(messages, result, stats, self._gen, self._scope)
             return
